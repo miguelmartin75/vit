@@ -1,0 +1,6 @@
+[submodule "3rdparty/fmt"]
+	path = 3rdparty/fmt
+	url = git@github.com:fmtlib/fmt.git
+[submodule "3rdparty/stb"]
+	path = 3rdparty/stb
+	url = git@github.com:nothings/stb.git
