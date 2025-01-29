@@ -6,6 +6,9 @@ import argparse
 from typing import Optional, Set
 
 
+from torch.utils.tensorboard import SummaryWriter
+from vit_pt_lucidrains import ViT as ViTRef, Attention
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -18,6 +21,13 @@ from PIL import Image
 
 logger = logging.getLogger(__name__)
 
+def count_parameters(model):
+    total_params = 0
+    for p in model.parameters():
+        if p.requires_grad:
+            total_params += p.numel()
+    return total_params
+
 
 class MSA(nn.Module):
     def __init__(self, dim, heads, dropout=0.0, fused = False):
@@ -29,10 +39,7 @@ class MSA(nn.Module):
         self.dropout_p = dropout
         self.dropout = nn.Dropout(dropout)
 
-        try:
-            self.scale = self.inner_dim ** -0.5
-        except:
-            breakpoint()
+        self.scale = self.inner_dim ** -0.5
 
         self.qkv = nn.Linear(dim, heads * self.inner_dim * 3, bias = False)
         self.norm = nn.LayerNorm(dim)
@@ -53,11 +60,13 @@ class MSA(nn.Module):
         if self.fused:
             x = F.scaled_dot_product_attention(
                 q, k, v,
+                scale=self.scale,
                 dropout_p=self.dropout_p,
             )
         else:
             sa = torch.matmul(q, k.transpose(-1, -2)) * self.scale
             sa = F.softmax(sa, dim=-1)
+            sa = self.dropout(sa)
             x = torch.matmul(sa, v)
     
         x = x.transpose(1, 2).reshape(b, n, c)
@@ -68,7 +77,7 @@ class MSA(nn.Module):
 class TransformerBlock(nn.Module):
     def __init__(self, dim, heads, mlp_dim, dropout=0.0):
         super().__init__()
-        self.msa = MSA(dim=dim, heads=heads, dropout=dropout, fused=True)
+        self.msa = MSA(dim=dim, heads=heads, dropout=dropout, fused=False)
         self.mlp = nn.Sequential(
             nn.LayerNorm(dim),
             nn.Linear(dim, mlp_dim),
@@ -77,12 +86,11 @@ class TransformerBlock(nn.Module):
             nn.Linear(mlp_dim, dim),
             nn.Dropout(dropout),
         )
-        self.norm = nn.LayerNorm(dim)
 
     def forward(self, x):
         x = self.msa(x) + x
         x = self.mlp(x) + x
-        return self.norm(x)
+        return x
 
 class TransformerEncoder(nn.Module):
     def __init__(self, n_layers, heads, dim, mlp_dim, dropout):
@@ -91,19 +99,21 @@ class TransformerEncoder(nn.Module):
             TransformerBlock(dim=dim, heads=heads, mlp_dim=mlp_dim, dropout=dropout)
             for i in range(n_layers)
         ])
+        self.norm = nn.LayerNorm(dim)
 
     def forward(self, x):
-        return self.encoder(x)
+        x = self.encoder(x)
+        return self.norm(x)
 
 class ViT(nn.Module):
-    def __init__(self, p=16, mlp_dim=2048, dim=1024, heads=8, num_layers=8, dropout=0.0, num_classes=1000, w=224, h=224, c=3):
+    def __init__(self, patch_size=16, mlp_dim=2048, dim=1024, heads=8, depth=8, dropout=0.0, num_classes=1000, image_size=224, c=3):
         super().__init__()
 
-        self.p = p
+        self.patch_size = patch_size
         self.dim = dim
         self.c = c
-        self.patch_dim = p * p * c
-        self.N = (w*h) // (p*p)
+        self.patch_dim = patch_size * patch_size * c
+        self.N = (image_size*image_size) // (patch_size*patch_size)
 
         self.class_tok = nn.Parameter(torch.randn(1, 1, dim))
         self.pos_emb = nn.Parameter(torch.randn(1, self.N + 1, dim))
@@ -113,9 +123,10 @@ class ViT(nn.Module):
             nn.LayerNorm(dim),
         )
         self.classify_head = nn.Linear(dim, num_classes)
+        self.dropout = nn.Dropout(dropout)
 
         self.transformer = TransformerEncoder(
-            n_layers=num_layers,
+            n_layers=depth,
             heads=heads,
             dim=dim,
             mlp_dim=mlp_dim,
@@ -130,17 +141,23 @@ class ViT(nn.Module):
         b, c, h, w = x.shape
 
         # get patches
-        x = x.view(b, -1, self.patch_dim)
+        x = x.unfold(2, self.patch_size, self.patch_size)
+        x = x.unfold(3, self.patch_size, self.patch_size)
+        # 0  1   2   3   4   5
+        # b, c, nh, nw, ps, ps -> b, nh, nw, c, ps, ps
+        x = x.permute(0, 2, 3, 4, 5, 1).reshape(b, -1, self.patch_size, self.patch_size, c)
+        n = x.shape[1]
+        x = x.reshape(b, n, self.patch_dim)
         x = self.patch_emb(x)
 
         # add class tok and pos embeddings
         class_toks = self.class_tok.repeat(b, 1, 1)
         x = torch.cat((class_toks, x), dim=1)
-        x = self.pos_emb + x
-        # TODO: dropout
+        # x += self.pos_emb[:, :(n+1)]
+        x += self.pos_emb
+        x = self.dropout(x)
 
         # feed patch into MLP
-        # b, n, dim
         x = self.transformer(x)
 
         x = x[:, 0]
@@ -152,7 +169,6 @@ def list_files(path):
     for root, _, files in os.walk(path):
         for f in files:
             yield os.path.join(root, f)
-            break  # TODO remove
 
 def dataset_folder_iter(
     dataset: str,
@@ -228,18 +244,49 @@ class ImageNet(torch.utils.data.Dataset):
 
     def __getitem__(self, idx):
         x = self.data[idx]
-        x["image"] = Image.open(x[".JPEG"]).convert("RGB")
+        try:
+            x["image"] = Image.open(x[".JPEG"]).convert("RGB")
+        except:
+            x["image"] = torch.zeros(3, 256, 256)
+
         x["image"] = self.transform(x["image"])
-        x["target"] = self.labels[x["dir"]][0]
+        # x["target"] = self.labels[x["dir"]][0]
         return x
 
 
 def train(args):
+    if args.ref:
+        model = ViTRef(
+            image_size = 256,
+            patch_size = 32,
+            num_classes = 1000,
+            depth = 12,
+            heads = 12,
+            dim = 768,
+            mlp_dim = 3072,
+            dropout = 0.1,
+        )
+    else:
+        model = ViT(
+            image_size = 256,
+            num_classes = 1000,
+            patch_size = 32,
+            depth = 12,
+            heads = 12,
+            dim = 768,
+            mlp_dim = 3072,
+            dropout = 0.1,
+        )
+    model = model.train().to(args.device)
+    model = torch.compile(model)
+    n_params = count_parameters(model)
+    print("model params=", n_params)
+
     train_dset = ImageNet(
         root="/datasets01/imagenet_full_size/061417/",
         split="train",
         transform=transforms.Compose([
-            transforms.Resize((224, 224)),
+            transforms.Resize((256, 256)),
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
         ]),
@@ -250,32 +297,35 @@ def train(args):
         batch_size=args.batch_size,
         shuffle=True,
     )
+    os.makedirs(args.log_dir, exist_ok=True)
+    writer = SummaryWriter(os.path.join(args.log_dir, args.name))
 
-    model = ViT()
-    model = model.train().to(args.device)
 
     optim = torch.optim.Adam(
         model.parameters(),
         lr=args.lr,
         betas=(0.9, 0.999),
-        weight_decay=0.1,
+        # weight_decay=0.1,
+        weight_decay=1e-3,
     )
-    torch.autograd.set_detect_anomaly(True)
     i = 0
-    for x in train_dloader:
-        optim.zero_grad()
-        y = model(x["image"].to(args.device))
-        target = x["target"].to(args.device)
-        loss = F.cross_entropy(y, target)
+    while i < args.niter:
+        for x in train_dloader:
+            optim.zero_grad()
+            y = model(x["image"].to(args.device))
+            target = x["target"].to(args.device)
+            loss = F.cross_entropy(y, target)
 
-        loss.backward()
-        optim.step()
-        if i % 10 == 0:
-            print(f"[{i}] loss={loss:.2f}", flush=True)
+            loss.backward()
+            optim.step()
+            if i % 10 == 0:
+                print(f"[{i}] loss={loss:.2f}", flush=True)
 
-        i += 1
-        if i >= 1_000:
-            break
+            writer.add_scalar("Loss/train", loss, i)
+
+            i += 1
+            if i >= args.niter:
+                break
 
     
 
@@ -287,9 +337,10 @@ if __name__ == "__main__":
     parser.add_argument(
         "--lr",
         type=float,
-        default=0.001,
+        default=1e-2,
     )
     parser.add_argument(
+        "-nw",
         "--num_workers",
         type=int,
         default=10,
@@ -297,12 +348,73 @@ if __name__ == "__main__":
     parser.add_argument(
         "--batch_size",
         type=int,
-        default=64,
+        # default=4_096,
+        default=256,
+    )
+    parser.add_argument(
+        "--niter",
+        type=int,
+        default=1_000_000,
     )
     parser.add_argument(
         "--device",
         type=str,
         default="cuda",
     )
+    parser.add_argument(
+        "--log_dir",
+        type=str,
+        default="logs",
+    )
+    parser.add_argument(
+        "--ref",
+        action="store_true",
+        default=False,
+    )
+    parser.add_argument(
+        "--name",
+        type=str,
+        default=None,
+        required=True,
+    )
     args = parser.parse_args()
-    train(args)
+
+
+
+    if False:
+        v = ViT(
+            image_size = 224,
+            patch_size = 16,
+            num_classes = 1000,
+            dim = 1024,
+            depth = 6,
+            heads = 16,
+            mlp_dim = 2048,
+            dropout = 0.1,
+            # emb_dropout = 0.1
+        )
+
+        v2 = ViTRef(
+            image_size = 224,
+            patch_size = 16,
+            num_classes = 1000,
+            dim = 1024,
+            depth = 6,
+            heads = 16,
+            mlp_dim = 2048,
+            dropout = 0.1,
+            emb_dropout = 0.1
+        )
+
+        img = torch.randn(1, 3, 224, 224)
+        y1 = v(img)
+        y2 = v2(img)
+
+        # input = torch.arange(81.).view(1, 9, 9)
+        # input = torch.stack([input, input*10, input*100])
+        # b, c, h, w = input.shape
+        # input.view(b, -1, 3, 3)
+        # patches = F.unfold(input, kernel_size=4, stride=4).view(b, -1, patch_dim)
+        breakpoint()
+    else:
+        train(args)

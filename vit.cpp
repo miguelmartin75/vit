@@ -8,11 +8,6 @@ TODO:
 - [ ] 
  */
 
-// CPU
-struct ViT_CPU {
-    // TODO
-};
-
 // Tensor rand3(u32 c, u32 h, u32, w) {
 //     // TODO
 // }
@@ -68,7 +63,7 @@ Tensor tensor_view(Tensor x, Shape shape) {
     };
 }
 
-Tensor tensor_concat(Tensor a, Tensor b, bool inplaceA = false) {
+Tensor tensor_cat(Tensor a, Tensor b, i32 dim) {
     // TODO
 }
 
@@ -84,7 +79,10 @@ Tensor tensor_variance(Tensor x, i32 dim) {
     // TODO
 }
 
-Tensor tensor_zeros_cpu(Shape shape) {
+Tensor tensor_layer_norm(Tensor x) {
+}
+
+Tensor tensor_zeros(Shape shape) {
     // TODO: use allocator
     i64 nelem = shape_nelem(shape);
     byte8* mem = (byte8*)calloc(sizeof(u32) * shape.n + nelem * sizeof(f32), 1);
@@ -99,6 +97,27 @@ Tensor tensor_zeros_cpu(Shape shape) {
     };
 }
 
+// CPU
+struct ViT_CPU {
+    // TODO
+    Tensor patch_Wb;
+    Tensor class_emb;
+
+    Tensor forward(Tensor input) {
+        // TODO: cpu postfix
+        Tensor x = tensor_view(input, shape_lit({-1, 16*16*3}));
+        x = tensor_layer_norm(x);
+
+        // N x (P*P*C) -> N * D
+        x = tensor_matmul(x, ctx->patch_Wb);
+        x = tensor_cat(class_emb, x, 1);
+
+        Tensor pos_emb; // TODO: getme
+        x = tensor_cat(pos_emb, x, 1);
+    }
+};
+
+
 ViT vit_init(ViTModelParams params) {
     // TODO: switch on device
     ViT ret;
@@ -111,21 +130,22 @@ void vit_destroy(ViT* vit) {
     vit->ctx = nullptr;
 }
 
-void vit_forward(ViT*, Tensor input) {
+Tensor vit_forward(ViT* vit, Tensor input) {
     // TODO: batched
-    // Tensor x = tensor_view(input, shape_lit({-1, 16*16*3}));
-    // 1. [ ] slice input into 16x16 patches
-    //    - C W H -> N X (3*16*16)
-    // 2. [ ] feed into MLP (two-layers)
+    // TODO: moveto vit_forward_cpu
+    ViT_CPU* cpu = (ViT_CPU*)vit->ctx;
+    cpu->forward(input);
+    // 2. [ ] feed into MLP (single layer)
     // 3. [ ] concat with position embeddings
     // 4. [ ] feed into L layers of 
 
 }
 
 Tensor vit_backward(ViT*) {
+    // TODO
 }
 
-// TODO: move
+// TODO: moveme to tests
 void test_shape() {
     Shape shape = shape_lit({-1, 16, 16});
     VIT_ASSERT(shape_nelem(shape) == -256);
@@ -136,7 +156,7 @@ void test_shape() {
 }
 
 void test_tensor_init() {
-    Tensor zeros = tensor_zeros_cpu(shape_lit({3, 224, 224}));
+    Tensor zeros = tensor_zeros(shape_lit({3, 224, 224}));
     VIT_ASSERT(shape_nelem(zeros.shape) == 150528);
 
     Tensor new_view = tensor_view(zeros, shape_lit({-1, 16*16}));
@@ -154,6 +174,6 @@ int main() {
         .patch_size = 16
     });
 
-    Tensor inp = tensor_zeros_cpu(shape_lit({3, 224, 224}));
+    Tensor inp = tensor_zeros(shape_lit({3, 224, 224}));
     vit_forward(&vit, inp);
 }
