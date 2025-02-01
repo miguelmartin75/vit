@@ -1,3 +1,5 @@
+import math
+import gc
 import sys
 import traceback
 import json
@@ -308,26 +310,46 @@ def create_dset_cache(args):
     #create_imagenet_dset_cache(args, "train")
     create_imagenet_dset_cache(args, "val")
 
-
-# TODO: generalize
-class JsonlDset(torch.utils.data.Dataset):
-    def __init__(self, path, transform):
-        super().__init__()
-        self.data = [json.loads(x) for x in open(path).readlines()]
-        self.transform = transform
-
-    def __len__(self):
-        return len(self.data)
-
-    def __getitem__(self, idx):
-        x = self.data[idx]
+def image_dset_iter(path, transform, start=0, end=None):
+    # TODO: shuffle?
+    xs = [json.loads(x) for x in open(path).readlines()]
+    xs = xs[start:end]
+    for x in xs:
         try:
             x["image"] = Image.open(x[".JPEG"]).convert("RGB")
         except:
             x["image"] = torch.zeros(3, 256, 256)
 
-        x["image"] = self.transform(x["image"])
-        return x
+        if transform is not None:
+            x["image"] = transform(x["image"])
+        yield x
+
+
+class JsonlDset(torch.utils.data.IterableDataset):
+    def __init__(self, path, transform):
+        super().__init__()
+        self.transform = transform
+        self.path = path
+
+    def __len__(self):
+        return len(self.data)
+
+    def __iter__(self):
+        # N = self.N  # TODO
+        N = 1281167
+        worker_info = torch.utils.data.get_worker_info()
+        # https://pytorch.org/docs/stable/data.html#torch.utils.data.IterableDataset
+        if worker_info is None:
+            start = 0
+            end = None
+        else:
+            per_worker = int(math.ceil(N / float(worker_info.num_workers)))
+            i = worker_info.id
+            start = i * per_worker
+            end = start + per_worker
+
+        return image_dset_iter(self.path, self.transform, start, end)
+
 
 def get_dataset(args, split, transform):
     return JsonlDset(
@@ -379,6 +401,7 @@ def train(args):
     n_params = count_parameters(model)
     print("model params=", n_params)
 
+    device = args.device
     def create_dataloader(split, shuffle):
         dset = get_dataset(
             args,
@@ -393,7 +416,10 @@ def train(args):
             dset,
             num_workers=args.num_workers,
             batch_size=args.batch_size,
-            shuffle=shuffle,
+            # shuffle=shuffle,
+            pin_memory=args.pin_memory,
+            persistent_workers=True,
+            pin_memory_device=device,
         )
 
     os.makedirs(args.log_dir, exist_ok=True)
@@ -449,13 +475,14 @@ def train(args):
             dataloader_avg.add(load_t2 - load_t1)
 
             forward_t1 = time_ms()
-            y = model(x["image"].to(args.device))
+            img = x["image"].to(device)
+            y = model(img)
             forward_t2 = time_ms()
             forward_avg.add(forward_t2 - forward_t1)
 
             backward_t1 = time_ms()
             optim.zero_grad()
-            target = x["target"].to(args.device)
+            target = x["target"].to(device)
             loss = F.cross_entropy(y, target)
             loss.backward()
             backward_t2 = time_ms()
@@ -477,8 +504,8 @@ def train(args):
                     acc5 = 0
                     n = 0
                     for x in tqdm(val_dloader):
-                        logits = model(x["image"].to(args.device))
-                        target = x["target"].to(args.device)
+                        logits = model(x["image"].to(device))
+                        target = x["target"].to(device)
                         a1, a5 = accuracy(logits, target, topk=(1, 5))
                         acc1 += a1
                         acc5 += a5
@@ -493,6 +520,8 @@ def train(args):
                 log_metrics()
 
             i += 1
+            torch.cuda.empty_cache()
+            gc.collect()
             if i >= args.niter:
                 break
 
@@ -577,6 +606,11 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--no_compile",
+        action="store_true",
+        default=False,
+    )
+    parser.add_argument(
+        "--pin_memory",
         action="store_true",
         default=False,
     )
