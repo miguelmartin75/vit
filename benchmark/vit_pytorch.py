@@ -324,6 +324,7 @@ def create_dset_cache(args):
     create_imagenet_dset_cache(args, "train", True)
     create_imagenet_dset_cache(args, "val", False)
 
+
 def load_sample(x, transform):
     with Image.open(x[".JPEG"]) as img:
         img = img.convert("RGB")
@@ -436,7 +437,7 @@ def create_dataloader(args, split, shuffle, device):
         "persistent_workers":args.num_workers > 0,
         "pin_memory_device":device if args.pin_memory else "",
     }
-    return dset, torch.utils.data.DataLoader(
+    return torch.utils.data.DataLoader(
         dset,
         **dloader_kwargs,
     )
@@ -444,7 +445,7 @@ def create_dataloader(args, split, shuffle, device):
 def profile_dataloader(args):
     assert args.profile_nsamples > args.profile_warmup, "need at least 1 sample to measure"
 
-    dset, dloader = create_dataloader(args, "train", False, args.device)
+    dloader = create_dataloader(args, "train", False, args.device)
     device = args.device
 
     N = len(dloader) if args.profile_nsamples < 0 else args.profile_nsamples
@@ -474,8 +475,9 @@ def profile_dataloader(args):
 
 
 def train(args):
-    if args.checkpoint_dir is None:
-        print("--checkpoint_dir not provided")
+    # TODO: continue from checkpoint
+    if args.chkpt_dir is None:
+        print("--chkpt_dir not provided")
         sys.exit(1)
 
     if args.ref:
@@ -507,11 +509,16 @@ def train(args):
     n_params = count_parameters(model)
     print("model params=", n_params)
 
-    device = args.device
-    os.makedirs(args.log_dir, exist_ok=True)
-    os.makedirs(args.checkpoint_dir, exist_ok=True)
-    writer = SummaryWriter(os.path.join(args.log_dir, args.name))
+    # ds_now = datetime.datetime.now().strftime("%Y-%m-%d")
+    # log_dir = os.path.join(args.log_dir, args.name, ds_now)
+    # chkpt_dir = os.path.join(args.chkpt_dir, ds_now)
+    log_dir = os.path.join(args.log_dir, args.name)
+    chkpt_dir = args.chkpt_dir
+    os.makedirs(log_dir, exist_ok=True)
+    os.makedirs(chkpt_dir, exist_ok=True)
+    writer = SummaryWriter(log_dir)
 
+    device = args.device
     optim = torch.optim.Adam(
         model.parameters(),
         lr=args.lr,
@@ -546,12 +553,13 @@ def train(args):
         log_t2 = time_ms()
         writer.add_scalar("Perf/log", log_t2 - log_t1, i)
 
-    train_dset, train_dloader = create_dataloader("train", True)
-    val_dset, val_dloader = create_dataloader("val", False)
+    train_dloader = create_dataloader(args, "train", shuffle=True, device=device)
+    val_dloader = create_dataloader(args, "val", shuffle=False, device=device)
 
     load_t1 = time_ms()
     total_t1 = time_ms()
     i = 0
+    last_k_chkpts = {}
     while i < args.niter:
         for x in train_dloader:
             load_t2 = time_ms()
@@ -561,7 +569,7 @@ def train(args):
             img = x["image"].to(device)
             y = model(img)
             forward_t2 = time_ms()
-            # forward_avg.add(forward_t2 - forward_t1)
+            forward_avg.add(forward_t2 - forward_t1)
 
             backward_t1 = time_ms()
             optim.zero_grad()
@@ -569,16 +577,17 @@ def train(args):
             loss = F.cross_entropy(y, target)
             loss.backward()
             backward_t2 = time_ms()
-            # backward_avg.add(backward_t2 - backward_t1)
-            # loss_avg.add(loss.detach().cpu().item())
+            backward_avg.add(backward_t2 - backward_t1)
+            loss_avg.add(loss.detach().cpu().item())
 
             optim_t1 = time_ms()
             optim.step()
             optim_t2 = time_ms()
-            # optim_avg.add(optim_t2 - optim_t1)
+            optim_avg.add(optim_t2 - optim_t1)
 
             total_t2 = time_ms()
-            # total_avg.add(total_t2 - total_t1)
+            total_avg.add(total_t2 - total_t1)
+            del img, target
             if (i != 0 or args.val_first_iter) and i % args.val_iter_freq == 0:
                 model = model.eval()
                 with torch.no_grad():
@@ -600,14 +609,39 @@ def train(args):
                     log_metrics({"top1": acc1, "top5": acc5})
                 model = model.train()
 
-                # TODO: write to checkpoint_dir
+                should_save = False
+                if len(last_k_chkpts) >= args.keep_k_chkpts:
+                    for idx, info in last_k_chkpts.items():
+                        if info["top1"] < acc1:
+                            should_save = True
+                            os.remove(info["path"])
+                            del last_k_chkpts[idx]
+                            break
+                else:
+                    should_save = True
+
+                if should_save:
+                    to_save = {
+                        "model_state_dict": model.state_dict(), 
+                        "optim_state_dict": optim.state_dict(), 
+                        "top1": 100*acc1, "top5": 100*acc5,
+                        "iter": i,
+                        "loss": loss_avg.get(),
+                    }
+                    path = os.path.join(chkpt_dir, f"{i}-top1:{100*acc1:.1f}.pt")
+                    torch.save(to_save, path)
+                    last_k_chkpts[i] = {}
+                    last_k_chkpts[i]["top1"] = acc1
+                    last_k_chkpts[i]["path"] = path
+
             elif i % args.iter_per_log == 0:
                 log_metrics()
 
-            del img, target
             i += 1
-            # torch.cuda.empty_cache()
-            # gc.collect()
+
+            if i % 1000 == 0:
+                torch.cuda.empty_cache()
+                gc.collect()
             if i >= args.niter:
                 break
 
@@ -696,9 +730,14 @@ if __name__ == "__main__":
         default=500,
     )
     parser.add_argument(
-        "--checkpoint_dir",
+        "--chkpt_dir",
         type=str,
         default=None,
+    )
+    parser.add_argument(
+        "--keep_k_chkpts",
+        type=int,
+        default=5,
     )
     parser.add_argument(
         "--ref",
