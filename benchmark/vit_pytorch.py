@@ -1,5 +1,6 @@
 import math
 import gc
+import copy
 import sys
 import traceback
 import json
@@ -24,12 +25,16 @@ from PIL import Image
 from tqdm.auto import tqdm
 
 from torch.utils.tensorboard import SummaryWriter
-from vit_pt_lucidrains import ViT as ViTRef
+# from vit_pt_lucidrains import ViT as ViTRef
 
 
 DSET_CACHE_DIR = "./datasets/"
 
 logger = logging.getLogger(__name__)
+
+def time_ms():
+    t = time.perf_counter_ns()
+    return t / 1e6
 
 def count_parameters(model):
     total_params = 0
@@ -58,6 +63,8 @@ class RollingAvg:
             self.data = self.data[1:]
 
     def get(self):
+        if not self.data:
+            return 0
         return sum(self.data) / len(self.data)
 
 class MSA(nn.Module):
@@ -276,7 +283,7 @@ def _imagenet_load_and_get_target(x):
         return None
     return x
 
-def create_imagenet_dset_cache(args, split):
+def create_imagenet_dset_cache(args, split, shuffle):
     root = args.imagenet_root
     label_txt_path = os.path.join(root, "labels.txt")
     labels = [(x.split(","), i) for i, x in enumerate(open(label_txt_path).readlines())]
@@ -296,76 +303,174 @@ def create_imagenet_dset_cache(args, split):
     with open(cache_path, "w") as out_f:
         print("Writing cache...")
         count = 0
+        xs = []
         for x in local_map(data, map_fn, num_workers=args.num_workers, progress=True):
             if x is None:
                 continue
-
             x["target"] = labels[x["dir"]][0]
+            xs.append(x)
+
+        if shuffle:
+            random.seed(42)
+            random.shuffle(xs)
+
+        for x in tqdm(xs):
             out_f.write(json.dumps(x) + "\n")
             count += 1
         print(f"{len(data)} -> {count}", flush=True)
 
 
 def create_dset_cache(args):
-    #create_imagenet_dset_cache(args, "train")
-    create_imagenet_dset_cache(args, "val")
+    create_imagenet_dset_cache(args, "train", True)
+    create_imagenet_dset_cache(args, "val", False)
 
-def image_dset_iter(path, transform, start=0, end=None):
-    # TODO: shuffle?
-    xs = [json.loads(x) for x in open(path).readlines()]
+def load_sample(x, transform):
+    with Image.open(x[".JPEG"]) as img:
+        img = img.convert("RGB")
+        x["image"] = img
+    if transform is not None:
+        x["image"] = transform(x["image"])
+    return x
+
+
+def dset_iter(xs, transform, shuffle, shuffle_buf_size, start=0, end=None):
     xs = xs[start:end]
-    for x in xs:
-        try:
-            x["image"] = Image.open(x[".JPEG"]).convert("RGB")
-        except:
-            x["image"] = torch.zeros(3, 256, 256)
+    buf_size = shuffle_buf_size if shuffle else 1
+    assert buf_size >= 1
 
-        if transform is not None:
-            x["image"] = transform(x["image"])
+    buf = []
+    for xx in xs:
+        buf.append(xx)
+        if len(buf) >= buf_size:
+            random.shuffle(buf)
+            for x in buf:
+                x = load_sample(copy.deepcopy(x), transform)
+                yield x
+            buf = []
+
+    for x in buf:
+        x = load_sample(copy.deepcopy(x), transform)
         yield x
 
 
-class JsonlDset(torch.utils.data.IterableDataset):
-    def __init__(self, path, transform):
+class JsonlDsetIter(torch.utils.data.IterableDataset):
+    def __init__(self, path, transform, shuffle, shuffle_buf_size):
         super().__init__()
         self.transform = transform
         self.path = path
+        self.data = [json.loads(x) for x in open(path).readlines()]
+        self.shuffle = shuffle
+        self.shuffle_buf_size = shuffle_buf_size
+        self.N = len(self.data)
 
     def __len__(self):
-        return len(self.data)
+        return self.N
 
     def __iter__(self):
-        # N = self.N  # TODO
-        N = 1281167
         worker_info = torch.utils.data.get_worker_info()
         # https://pytorch.org/docs/stable/data.html#torch.utils.data.IterableDataset
         if worker_info is None:
             start = 0
             end = None
         else:
+            N = self.N
             per_worker = int(math.ceil(N / float(worker_info.num_workers)))
             i = worker_info.id
             start = i * per_worker
             end = start + per_worker
 
-        return image_dset_iter(self.path, self.transform, start, end)
+        return dset_iter(
+            xs=self.data,
+            transform=self.transform,
+            shuffle=self.shuffle,
+            shuffle_buf_size=self.shuffle_buf_size,
+            start=start,
+            end=end,
+        )
 
 
-def get_dataset(args, split, transform):
-    return JsonlDset(
-        path=os.path.join(DSET_CACHE_DIR, f"imagenet-{split}.jsonl"),
-        transform=transform,
+class JsonlDset(torch.utils.data.Dataset):
+    def __init__(self, path, transform):
+        super().__init__()
+        self.transform = transform
+        self.path = path
+        self.data = [json.loads(x) for x in open(path).readlines()]
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        return load_sample(copy.deepcopy(self.data[idx]), self.transform)
+
+
+def get_dataset(args, split, transform, shuffle):
+    if args.use_iter_dsets:
+        return JsonlDsetIter(
+            path=os.path.join(DSET_CACHE_DIR, f"imagenet-{split}.jsonl"),
+            transform=transform,
+            shuffle=shuffle,
+            shuffle_buf_size=args.shuffle_buf_size,
+        )
+    else:
+        return JsonlDset(
+            path=os.path.join(DSET_CACHE_DIR, f"imagenet-{split}.jsonl"),
+            transform=transform,
+        )
+
+def create_dataloader(args, split, shuffle, device):
+    dset = get_dataset(
+        args,
+        split=split,
+        transform=transforms.Compose([
+            transforms.Resize((args.img_size, args.img_size)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        ]),
+        shuffle=shuffle,
+    )
+    dloader_kwargs = {
+        "num_workers":args.num_workers,
+        "batch_size":args.batch_size,
+        "shuffle": False if args.use_iter_dsets else shuffle,
+        "pin_memory":args.pin_memory,
+        "persistent_workers":args.num_workers > 0,
+        "pin_memory_device":device if args.pin_memory else "",
+    }
+    return dset, torch.utils.data.DataLoader(
+        dset,
+        **dloader_kwargs,
     )
 
+def profile_dataloader(args):
+    assert args.profile_nsamples > args.profile_warmup, "need at least 1 sample to measure"
 
-def check_dataset(args):
-    dset = get_dataset(args, "train", None)
-    for i in tqdm(range(len(dset)), total=len(dset)):
-        try:
-            x = dset[i]
-        except:
-            print(i, traceback.format_exc())
-            continue
+    dset, dloader = create_dataloader(args, "train", False, args.device)
+    device = args.device
+
+    N = len(dloader) if args.profile_nsamples < 0 else args.profile_nsamples
+    print(f"profiling {N} batches, device={device}, warmup={args.profile_warmup}")
+
+    t_samples = []
+    i = 0
+    n_samples = 0
+    t1 = time_ms()
+    for x in tqdm(dloader, total=N):
+        img = x["image"].to(device)
+        target = x["target"].to(device)
+        n_samples += img.shape[0]
+        t2 = time_ms()
+        del img, target
+
+        t_samples.append(t2 - t1)
+        i += 1
+        if i > N:
+            break
+
+        t1 = time_ms()
+
+    t_samples = torch.tensor(t_samples[args.profile_warmup:])
+    print(f"mean={t_samples.mean():.3f}ms, std={t_samples.std():.3f}ms, min={t_samples.min():.3f}ms, max={t_samples.max():.3f}ms", flush=True)
+    print(f"samples/sec={1000*n_samples / t_samples.sum():.3f}")
 
 
 def train(args):
@@ -374,16 +479,17 @@ def train(args):
         sys.exit(1)
 
     if args.ref:
-        model = ViTRef(
-            image_size = args.img_size,
-            patch_size = 32,
-            num_classes = 1000,
-            depth = 12,
-            heads = 12,
-            dim = 768,
-            mlp_dim = 3072,
-            dropout = 0.1,
-        )
+        raise AssertionError("unsupported")
+        # model = ViTRef(
+        #     image_size = args.img_size,
+        #     patch_size = 32,
+        #     num_classes = 1000,
+        #     depth = 12,
+        #     heads = 12,
+        #     dim = 768,
+        #     mlp_dim = 3072,
+        #     dropout = 0.1,
+        # )
     else:
         model = ViT(
             image_size = args.img_size,
@@ -402,33 +508,9 @@ def train(args):
     print("model params=", n_params)
 
     device = args.device
-    def create_dataloader(split, shuffle):
-        dset = get_dataset(
-            args,
-            split=split,
-            transform=transforms.Compose([
-                transforms.Resize((args.img_size, args.img_size)),
-                transforms.ToTensor(),
-                transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-            ]),
-        )
-        return torch.utils.data.DataLoader(
-            dset,
-            num_workers=args.num_workers,
-            batch_size=args.batch_size,
-            # shuffle=shuffle,
-            pin_memory=args.pin_memory,
-            persistent_workers=True,
-            pin_memory_device=device,
-        )
-
     os.makedirs(args.log_dir, exist_ok=True)
     os.makedirs(args.checkpoint_dir, exist_ok=True)
     writer = SummaryWriter(os.path.join(args.log_dir, args.name))
-
-    def time_ms():
-        t = time.perf_counter_ns()
-        return t / 1e6
 
     optim = torch.optim.Adam(
         model.parameters(),
@@ -464,7 +546,8 @@ def train(args):
         log_t2 = time_ms()
         writer.add_scalar("Perf/log", log_t2 - log_t1, i)
 
-    train_dloader = create_dataloader("train", True)
+    train_dset, train_dloader = create_dataloader("train", True)
+    val_dset, val_dloader = create_dataloader("val", False)
 
     load_t1 = time_ms()
     total_t1 = time_ms()
@@ -478,7 +561,7 @@ def train(args):
             img = x["image"].to(device)
             y = model(img)
             forward_t2 = time_ms()
-            forward_avg.add(forward_t2 - forward_t1)
+            # forward_avg.add(forward_t2 - forward_t1)
 
             backward_t1 = time_ms()
             optim.zero_grad()
@@ -486,42 +569,45 @@ def train(args):
             loss = F.cross_entropy(y, target)
             loss.backward()
             backward_t2 = time_ms()
-            backward_avg.add(backward_t2 - backward_t1)
-            loss_avg.add(loss.detach().cpu().item())
+            # backward_avg.add(backward_t2 - backward_t1)
+            # loss_avg.add(loss.detach().cpu().item())
 
             optim_t1 = time_ms()
             optim.step()
             optim_t2 = time_ms()
-            optim_avg.add(optim_t2 - optim_t1)
+            # optim_avg.add(optim_t2 - optim_t1)
 
             total_t2 = time_ms()
-            total_avg.add(total_t2 - total_t1)
+            # total_avg.add(total_t2 - total_t1)
             if (i != 0 or args.val_first_iter) and i % args.val_iter_freq == 0:
-                val_dloader = create_dataloader("val", False)
                 model = model.eval()
                 with torch.no_grad():
                     acc1 = 0
                     acc5 = 0
                     n = 0
                     for x in tqdm(val_dloader):
-                        logits = model(x["image"].to(device))
+                        img = x["image"].to(device)
+                        logits = model(img)
                         target = x["target"].to(device)
                         a1, a5 = accuracy(logits, target, topk=(1, 5))
                         acc1 += a1
                         acc5 += a5
                         n += x["image"].shape[0]
+                        del logits, img, target
+
                     acc1 /= n
                     acc5 /= n
                     log_metrics({"top1": acc1, "top5": acc5})
                 model = model.train()
-                # TODO: write to checkpoint_dir
 
+                # TODO: write to checkpoint_dir
             elif i % args.iter_per_log == 0:
                 log_metrics()
 
+            del img, target
             i += 1
-            torch.cuda.empty_cache()
-            gc.collect()
+            # torch.cuda.empty_cache()
+            # gc.collect()
             if i >= args.niter:
                 break
 
@@ -554,6 +640,16 @@ if __name__ == "__main__":
         default=10,
     )
     parser.add_argument(
+        "--shuffle_buf_size",
+        type=int,
+        default=4096,
+    )
+    parser.add_argument(
+        "--use_iter_dsets",
+        action="store_true",
+        default=False,
+    )
+    parser.add_argument(
         "--batch_size",
         type=int,
         # default=4_096,
@@ -563,6 +659,16 @@ if __name__ == "__main__":
         "--niter",
         type=int,
         default=1_000_000,
+    )
+    parser.add_argument(
+        "--profile_nsamples",
+        type=int,
+        default=200,
+    )
+    parser.add_argument(
+        "--profile_warmup",
+        type=int,
+        default=15,
     )
     parser.add_argument(
         "--device",
@@ -664,8 +770,8 @@ if __name__ == "__main__":
         breakpoint()
     elif args.mode == "create_dset_cache":
         create_dset_cache(args)
-    elif args.mode == "check_dataset":
-        check_dataset(args)
+    elif args.mode == "profile_dataloader":
+        profile_dataloader(args)
     else:
         assert args.mode == "train"
         train(args)
