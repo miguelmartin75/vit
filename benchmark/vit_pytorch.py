@@ -1,3 +1,4 @@
+import sys
 import traceback
 import json
 import time
@@ -10,10 +11,6 @@ from typing import Optional, Set
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
 
 
-from torch.utils.tensorboard import SummaryWriter
-from vit_pt_lucidrains import ViT as ViTRef, Attention
-
-from tqdm.auto import tqdm
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -22,6 +19,10 @@ import torchvision.transforms as transforms
 import torchvision.transforms.functional as TF
 
 from PIL import Image
+from tqdm.auto import tqdm
+
+from torch.utils.tensorboard import SummaryWriter
+from vit_pt_lucidrains import ViT as ViTRef
 
 
 DSET_CACHE_DIR = "./datasets/"
@@ -35,6 +36,14 @@ def count_parameters(model):
             total_params += p.numel()
     return total_params
 
+# taken from: https://github.com/mlfoundations/open_clip/blob/main/src/training/zero_shot.py#L29
+def accuracy(output, target, topk=(1,)):
+    pred = output.topk(max(topk), 1, True, True)[1].t()
+    correct = pred.eq(target.view(1, -1).expand_as(pred))
+    return [
+        float(correct[:k].reshape(-1).float().sum(0, keepdim=True).cpu().numpy())
+        for k in topk
+    ]
 
 class RollingAvg:
     def __init__(self, n):
@@ -264,8 +273,7 @@ def _imagenet_load_and_get_target(x):
     return x
 
 def create_imagenet_dset_cache(args, split):
-    # TODO: args.imagenet_root
-    root = "/datasets01/imagenet_full_size/061417/"
+    root = args.imagenet_root
     label_txt_path = os.path.join(root, "labels.txt")
     labels = [(x.split(","), i) for i, x in enumerate(open(label_txt_path).readlines())]
     labels = {x[0]: (i, x[1].strip()) for x, i in labels}
@@ -295,8 +303,8 @@ def create_imagenet_dset_cache(args, split):
 
 
 def create_dset_cache(args):
-    # TODO: val
-    create_imagenet_dset_cache(args, "train")
+    #create_imagenet_dset_cache(args, "train")
+    create_imagenet_dset_cache(args, "val")
 
 
 # TODO: generalize
@@ -337,9 +345,13 @@ def check_dataset(args):
 
 
 def train(args):
+    if args.checkpoint_dir is None:
+        print("--checkpoint_dir not provided")
+        sys.exit(1)
+
     if args.ref:
         model = ViTRef(
-            image_size = 256,
+            image_size = args.img_size,
             patch_size = 32,
             num_classes = 1000,
             depth = 12,
@@ -350,7 +362,7 @@ def train(args):
         )
     else:
         model = ViT(
-            image_size = 256,
+            image_size = args.img_size,
             num_classes = 1000,
             patch_size = 32,
             depth = 12,
@@ -365,22 +377,25 @@ def train(args):
     n_params = count_parameters(model)
     print("model params=", n_params)
 
-    train_dset = get_dataset(
-        args,
-        split="train",
-        transform=transforms.Compose([
-            transforms.Resize((256, 256)),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-        ]),
-    )
-    train_dloader = torch.utils.data.DataLoader(
-        train_dset,
-        num_workers=args.num_workers,
-        batch_size=args.batch_size,
-        shuffle=True,
-    )
+    def create_dataloader(split, shuffle):
+        dset = get_dataset(
+            args,
+            split=split,
+            transform=transforms.Compose([
+                transforms.Resize((args.img_size, args.img_size)),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+            ]),
+        )
+        return torch.utils.data.DataLoader(
+            dset,
+            num_workers=args.num_workers,
+            batch_size=args.batch_size,
+            shuffle=shuffle,
+        )
+
     os.makedirs(args.log_dir, exist_ok=True)
+    os.makedirs(args.checkpoint_dir, exist_ok=True)
     writer = SummaryWriter(os.path.join(args.log_dir, args.name))
 
     def time_ms():
@@ -391,8 +406,7 @@ def train(args):
         model.parameters(),
         lr=args.lr,
         betas=(0.9, 0.999),
-        # weight_decay=0.1,
-        weight_decay=1e-3,
+        weight_decay=args.weight_decay,
     )
     loss_avg = RollingAvg(args.iter_per_log)
     load_avg = RollingAvg(args.iter_per_log)
@@ -401,6 +415,28 @@ def train(args):
     optim_avg = RollingAvg(args.iter_per_log)
     dataloader_avg = RollingAvg(args.iter_per_log)
     total_avg = RollingAvg(args.iter_per_log)
+
+    def log_metrics(val_metrics=None):
+        log_t1 = time_ms()
+        if val_metrics is None:
+            print(f"[{i}] loss={loss:.2f}", flush=True)
+        else:
+            print(f"[{i}] loss={loss:.2f}, val={val_metrics}", flush=True)
+        # TODO: avg of past N iters
+        writer.add_scalar("Loss/train", loss_avg.get(), i)
+        if val_metrics is not None:
+            for k, v in val_metrics.items():
+                writer.add_scalar(f"Val/{k}", v, i)
+
+        writer.add_scalar("Perf/dataloader", dataloader_avg.get(), i)
+        writer.add_scalar("Perf/forward", forward_avg.get(), i)
+        writer.add_scalar("Perf/backward", backward_avg.get(), i)
+        writer.add_scalar("Perf/optim", optim_avg.get(), i)
+        writer.add_scalar("Perf/total", total_avg.get(), i)
+        log_t2 = time_ms()
+        writer.add_scalar("Perf/log", log_t2 - log_t1, i)
+
+    train_dloader = create_dataloader("train", True)
 
     load_t1 = time_ms()
     total_t1 = time_ms()
@@ -429,27 +465,37 @@ def train(args):
             optim_t2 = time_ms()
             optim_avg.add(optim_t2 - optim_t1)
 
+            total_t2 = time_ms()
+            total_avg.add(total_t2 - total_t1)
+            if (i != 0 or args.val_first_iter) and i % args.val_iter_freq == 0:
+                val_dloader = create_dataloader("val", False)
+                model = model.eval()
+                with torch.no_grad():
+                    acc1 = 0
+                    acc5 = 0
+                    n = 0
+                    for x in tqdm(val_dloader):
+                        logits = model(x["image"].to(args.device))
+                        target = x["target"].to(args.device)
+                        a1, a5 = accuracy(logits, target, topk=(1, 5))
+                        acc1 += a1
+                        acc5 += a5
+                        n += x["image"].shape[0]
+                    acc1 /= n
+                    acc5 /= n
+                    log_metrics({"top1": acc1, "top5": acc5})
+                model = model.train()
+                # TODO: write to checkpoint_dir
+
+            elif i % args.iter_per_log == 0:
+                log_metrics()
+
             i += 1
             if i >= args.niter:
                 break
-            total_t2 = time_ms()
-            total_avg.add(total_t2 - total_t1)
-            if i % args.iter_per_log == 0:
-                log_t1 = time_ms()
-                print(f"[{i}] loss={loss:.2f}", flush=True)
-                # TODO: avg of past N iters
-                writer.add_scalar("Loss/train", loss_avg.get(), i)
-                writer.add_scalar("Perf/dataloader", dataloader_avg.get(), i)
-                writer.add_scalar("Perf/forward", forward_avg.get(), i)
-                writer.add_scalar("Perf/backward", backward_avg.get(), i)
-                writer.add_scalar("Perf/optim", optim_avg.get(), i)
-                writer.add_scalar("Perf/total", total_avg.get(), i)
-                log_t2 = time_ms()
-                writer.add_scalar("Perf/log", log_t2 - log_t1, i)
+
             total_t1 = time_ms()
             load_t1 = time_ms()
-
-    
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
@@ -464,6 +510,11 @@ if __name__ == "__main__":
         "--lr",
         type=float,
         default=1e-2,
+    )
+    parser.add_argument(
+        "--weight_decay",
+        type=float,
+        default=1e-5,
     )
     parser.add_argument(
         "-nw",
@@ -498,7 +549,27 @@ if __name__ == "__main__":
         default=20,
     )
     parser.add_argument(
+        "--img_size",
+        type=int,
+        default=256,
+    )
+    parser.add_argument(
+        "--val_iter_freq",
+        type=int,
+        default=500,
+    )
+    parser.add_argument(
+        "--checkpoint_dir",
+        type=str,
+        default=None,
+    )
+    parser.add_argument(
         "--ref",
+        action="store_true",
+        default=False,
+    )
+    parser.add_argument(
+        "--val_first_iter",
         action="store_true",
         default=False,
     )
@@ -512,6 +583,11 @@ if __name__ == "__main__":
         type=str,
         default=None,
         required=True,
+    )
+    parser.add_argument(
+        "--imagenet_root",
+        type=str,
+        default=None,
     )
     args = parser.parse_args()
 
