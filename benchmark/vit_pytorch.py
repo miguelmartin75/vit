@@ -106,7 +106,9 @@ class MSA(nn.Module):
 class TransformerBlock(nn.Module):
     def __init__(self, dim, heads, mlp_dim, dropout=0.0):
         super().__init__()
-        self.msa = MSA(dim=dim, heads=heads, dropout=dropout, fused=False)
+        # self.msa = MSA(dim=dim, heads=heads, dropout=dropout, fused=False)
+        # TODO: arg for fused
+        self.msa = MSA(dim=dim, heads=heads, dropout=dropout, fused=True)
         self.mlp = nn.Sequential(
             nn.LayerNorm(dim),
             nn.Linear(dim, mlp_dim),
@@ -452,6 +454,7 @@ def train(args):
             forward_avg.add(forward_t2 - forward_t1)
 
             backward_t1 = time_ms()
+            optim.zero_grad()
             target = x["target"].to(args.device)
             loss = F.cross_entropy(y, target)
             loss.backward()
@@ -460,7 +463,6 @@ def train(args):
             loss_avg.add(loss.detach().cpu().item())
 
             optim_t1 = time_ms()
-            optim.zero_grad()
             optim.step()
             optim_t2 = time_ms()
             optim_avg.add(optim_t2 - optim_t1)
