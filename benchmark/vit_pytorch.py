@@ -1,3 +1,4 @@
+import json
 import time
 import os
 import logging
@@ -9,6 +10,7 @@ from typing import Optional, Set
 from torch.utils.tensorboard import SummaryWriter
 from vit_pt_lucidrains import ViT as ViTRef, Attention
 
+from tqdm.auto import tqdm
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -18,6 +20,8 @@ import torchvision.transforms.functional as TF
 
 from PIL import Image
 
+
+CACHE_DIR = "./cache/"
 
 logger = logging.getLogger(__name__)
 
@@ -231,12 +235,24 @@ class ImageNet(torch.utils.data.Dataset):
         self.label_txt = os.path.join(root, "labels.txt")
         self.labels = [(x.split(","), i) for i, x in enumerate(open(self.label_txt).readlines())]
         self.labels = {x[0]: (i, x[1].strip()) for x, i in self.labels}
-        self.data = list(dataset_folder_iter(
-            os.path.join(self.root, split),
-            0,
-            None,
-            shuffle=False,
-        ))
+        cache_path = os.path.join(CACHE_DIR, f"imagenet-{split}.jsonl")
+
+        self.data = []
+        if os.path.exists(cache_path):
+            self.data = [json.loads(x) for x in open(cache_path).readlines()]
+
+        if len(self.data) == 0:
+            self.data = list(dataset_folder_iter(
+                os.path.join(self.root, split),
+                0,
+                None,
+                shuffle=False,
+            ))
+            os.makedirs(CACHE_DIR, exist_ok=True)
+            with open(cache_path, "w") as out_f:
+                print("Writing cache")
+                for x in tqdm(self.data):
+                    out_f.write(json.dumps(x) + "\n")
         self.transform = transform
 
     def __len__(self):
@@ -300,6 +316,9 @@ def train(args):
     os.makedirs(args.log_dir, exist_ok=True)
     writer = SummaryWriter(os.path.join(args.log_dir, args.name))
 
+    def time_ms():
+        t = time.perf_counter_ns()
+        return t / 1e6
 
     optim = torch.optim.Adam(
         model.parameters(),
@@ -308,24 +327,44 @@ def train(args):
         # weight_decay=0.1,
         weight_decay=1e-3,
     )
+    load_t1 = time_ms()
     i = 0
     while i < args.niter:
+        total_t1 = time_ms()
         for x in train_dloader:
-            optim.zero_grad()
-            y = model(x["image"].to(args.device))
-            target = x["target"].to(args.device)
-            loss = F.cross_entropy(y, target)
+            load_t2 = time_ms()
 
+            optim.zero_grad()
+            forward_t1 = time_ms()
+            y = model(x["image"].to(args.device))
+            forward_t2 = time_ms()
+
+            target = x["target"].to(args.device)
+            backward_t1 = time_ms()
+            loss = F.cross_entropy(y, target)
             loss.backward()
+            backward_t2 = time_ms()
+
+            optim_t1 = time_ms()
             optim.step()
+            optim_t2 = time_ms()
+
             if i % 10 == 0:
                 print(f"[{i}] loss={loss:.2f}", flush=True)
 
-            writer.add_scalar("Loss/train", loss, i)
+            writer.add_scalar("Loss/train", loss.detach().cpu().item(), i)
+            writer.add_scalar("Perf/dataloader", load_t2 - load_t1, i)
+            writer.add_scalar("Perf/foward", forward_t2 - forward_t1, i)
+            writer.add_scalar("Perf/backward", backward_t2 - backward_t1, i)
+            writer.add_scalar("Perf/optim", optim_t2 - optim_t1, i)
 
             i += 1
             if i >= args.niter:
                 break
+            load_t1 = time_ms()
+            total_t2 = time_ms()
+            writer.add_scalar("Perf/total", total_t2 - total_t1, i)
+            total_t1 = time_ms()
 
     
 
