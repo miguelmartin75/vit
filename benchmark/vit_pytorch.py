@@ -1,10 +1,13 @@
+import traceback
 import json
 import time
 import os
 import logging
 import random
 import argparse
+import functools
 from typing import Optional, Set
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
 
 
 from torch.utils.tensorboard import SummaryWriter
@@ -21,7 +24,7 @@ import torchvision.transforms.functional as TF
 from PIL import Image
 
 
-CACHE_DIR = "./cache/"
+DSET_CACHE_DIR = "./datasets/"
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +35,19 @@ def count_parameters(model):
             total_params += p.numel()
     return total_params
 
+
+class RollingAvg:
+    def __init__(self, n):
+        self.n = n
+        self.data = []
+
+    def add(self, x):
+        self.data.append(x)
+        if len(self.data) >= self.n:
+            self.data = self.data[1:]
+
+    def get(self):
+        return sum(self.data) / len(self.data)
 
 class MSA(nn.Module):
     def __init__(self, dim, heads, dropout=0.0, fused = False):
@@ -228,31 +244,66 @@ def dataset_folder_iter(
             "target": target,
         }
 
-class ImageNet(torch.utils.data.Dataset):
-    def __init__(self, root, split, transform):
+
+def local_map(xs, map_fn, num_workers, process=True, progress=False):
+    executor_class = ProcessPoolExecutor
+    if not process:
+        executor_class = ThreadPoolExecutor
+    with executor_class(num_workers) as pool:
+        for x in tqdm(pool.map(map_fn, xs), total=len(xs)):
+            yield x
+
+def _imagenet_load_and_get_target(x):
+    if not os.path.exists(x[".JPEG"]):
+        return None
+    try:
+        _ = Image.open(x[".JPEG"]).convert("RGB")
+    except:
+        print(traceback.format_exc())
+        return None
+    return x
+
+def create_imagenet_dset_cache(args, split):
+    # TODO: args.imagenet_root
+    root = "/datasets01/imagenet_full_size/061417/"
+    label_txt_path = os.path.join(root, "labels.txt")
+    labels = [(x.split(","), i) for i, x in enumerate(open(label_txt_path).readlines())]
+    labels = {x[0]: (i, x[1].strip()) for x, i in labels}
+
+    cache_path = os.path.join(DSET_CACHE_DIR, f"imagenet-{split}.jsonl")
+    os.makedirs(DSET_CACHE_DIR, exist_ok=True)
+
+    data = list(dataset_folder_iter(
+        os.path.join(root, split),
+        0,
+        None,
+        shuffle=False,
+    ))
+
+    map_fn = _imagenet_load_and_get_target
+    with open(cache_path, "w") as out_f:
+        print("Writing cache...")
+        count = 0
+        for x in local_map(data, map_fn, num_workers=args.num_workers, progress=True):
+            if x is None:
+                continue
+
+            x["target"] = labels[x["dir"]][0]
+            out_f.write(json.dumps(x) + "\n")
+            count += 1
+        print(f"{len(data)} -> {count}", flush=True)
+
+
+def create_dset_cache(args):
+    # TODO: val
+    create_imagenet_dset_cache(args, "train")
+
+
+# TODO: generalize
+class JsonlDset(torch.utils.data.Dataset):
+    def __init__(self, path, transform):
         super().__init__()
-        self.root = root
-        self.label_txt = os.path.join(root, "labels.txt")
-        self.labels = [(x.split(","), i) for i, x in enumerate(open(self.label_txt).readlines())]
-        self.labels = {x[0]: (i, x[1].strip()) for x, i in self.labels}
-        cache_path = os.path.join(CACHE_DIR, f"imagenet-{split}.jsonl")
-
-        self.data = []
-        if os.path.exists(cache_path):
-            self.data = [json.loads(x) for x in open(cache_path).readlines()]
-
-        if len(self.data) == 0:
-            self.data = list(dataset_folder_iter(
-                os.path.join(self.root, split),
-                0,
-                None,
-                shuffle=False,
-            ))
-            os.makedirs(CACHE_DIR, exist_ok=True)
-            with open(cache_path, "w") as out_f:
-                print("Writing cache")
-                for x in tqdm(self.data):
-                    out_f.write(json.dumps(x) + "\n")
+        self.data = [json.loads(x) for x in open(path).readlines()]
         self.transform = transform
 
     def __len__(self):
@@ -266,8 +317,23 @@ class ImageNet(torch.utils.data.Dataset):
             x["image"] = torch.zeros(3, 256, 256)
 
         x["image"] = self.transform(x["image"])
-        # x["target"] = self.labels[x["dir"]][0]
         return x
+
+def get_dataset(args, split, transform):
+    return JsonlDset(
+        path=os.path.join(DSET_CACHE_DIR, f"imagenet-{split}.jsonl"),
+        transform=transform,
+    )
+
+
+def check_dataset(args):
+    dset = get_dataset(args, "train", None)
+    for i in tqdm(range(len(dset)), total=len(dset)):
+        try:
+            x = dset[i]
+        except:
+            print(i, traceback.format_exc())
+            continue
 
 
 def train(args):
@@ -294,12 +360,13 @@ def train(args):
             dropout = 0.1,
         )
     model = model.train().to(args.device)
-    model = torch.compile(model)
+    if args.no_compile:
+        model = torch.compile(model)
     n_params = count_parameters(model)
     print("model params=", n_params)
 
-    train_dset = ImageNet(
-        root="/datasets01/imagenet_full_size/061417/",
+    train_dset = get_dataset(
+        args,
         split="train",
         transform=transforms.Compose([
             transforms.Resize((256, 256)),
@@ -327,44 +394,60 @@ def train(args):
         # weight_decay=0.1,
         weight_decay=1e-3,
     )
+    loss_avg = RollingAvg(args.iter_per_log)
+    load_avg = RollingAvg(args.iter_per_log)
+    forward_avg = RollingAvg(args.iter_per_log)
+    backward_avg = RollingAvg(args.iter_per_log)
+    optim_avg = RollingAvg(args.iter_per_log)
+    dataloader_avg = RollingAvg(args.iter_per_log)
+    total_avg = RollingAvg(args.iter_per_log)
+
     load_t1 = time_ms()
+    total_t1 = time_ms()
     i = 0
     while i < args.niter:
-        total_t1 = time_ms()
         for x in train_dloader:
             load_t2 = time_ms()
+            dataloader_avg.add(load_t2 - load_t1)
 
-            optim.zero_grad()
             forward_t1 = time_ms()
             y = model(x["image"].to(args.device))
             forward_t2 = time_ms()
+            forward_avg.add(forward_t2 - forward_t1)
 
-            target = x["target"].to(args.device)
             backward_t1 = time_ms()
+            target = x["target"].to(args.device)
             loss = F.cross_entropy(y, target)
             loss.backward()
             backward_t2 = time_ms()
+            backward_avg.add(backward_t2 - backward_t1)
+            loss_avg.add(loss.detach().cpu().item())
 
             optim_t1 = time_ms()
+            optim.zero_grad()
             optim.step()
             optim_t2 = time_ms()
-
-            if i % 10 == 0:
-                print(f"[{i}] loss={loss:.2f}", flush=True)
-
-            writer.add_scalar("Loss/train", loss.detach().cpu().item(), i)
-            writer.add_scalar("Perf/dataloader", load_t2 - load_t1, i)
-            writer.add_scalar("Perf/foward", forward_t2 - forward_t1, i)
-            writer.add_scalar("Perf/backward", backward_t2 - backward_t1, i)
-            writer.add_scalar("Perf/optim", optim_t2 - optim_t1, i)
+            optim_avg.add(optim_t2 - optim_t1)
 
             i += 1
             if i >= args.niter:
                 break
-            load_t1 = time_ms()
             total_t2 = time_ms()
-            writer.add_scalar("Perf/total", total_t2 - total_t1, i)
+            total_avg.add(total_t2 - total_t1)
+            if i % args.iter_per_log == 0:
+                log_t1 = time_ms()
+                print(f"[{i}] loss={loss:.2f}", flush=True)
+                # TODO: avg of past N iters
+                writer.add_scalar("Loss/train", loss_avg.get(), i)
+                writer.add_scalar("Perf/dataloader", dataloader_avg.get(), i)
+                writer.add_scalar("Perf/forward", forward_avg.get(), i)
+                writer.add_scalar("Perf/backward", backward_avg.get(), i)
+                writer.add_scalar("Perf/optim", optim_avg.get(), i)
+                writer.add_scalar("Perf/total", total_avg.get(), i)
+                log_t2 = time_ms()
+                writer.add_scalar("Perf/log", log_t2 - log_t1, i)
             total_t1 = time_ms()
+            load_t1 = time_ms()
 
     
 
@@ -372,6 +455,10 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         prog='ViT',
         description='Trains a ViT',
+    )
+    parser.add_argument(
+        "mode",
+        type=str,
     )
     parser.add_argument(
         "--lr",
@@ -406,7 +493,17 @@ if __name__ == "__main__":
         default="logs",
     )
     parser.add_argument(
+        "--iter_per_log",
+        type=int,
+        default=20,
+    )
+    parser.add_argument(
         "--ref",
+        action="store_true",
+        default=False,
+    )
+    parser.add_argument(
+        "--no_compile",
         action="store_true",
         default=False,
     )
@@ -418,9 +515,7 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-
-
-    if False:
+    if args.mode == "test":
         v = ViT(
             image_size = 224,
             patch_size = 16,
@@ -455,5 +550,10 @@ if __name__ == "__main__":
         # input.view(b, -1, 3, 3)
         # patches = F.unfold(input, kernel_size=4, stride=4).view(b, -1, patch_dim)
         breakpoint()
+    elif args.mode == "create_dset_cache":
+        create_dset_cache(args)
+    elif args.mode == "check_dataset":
+        check_dataset(args)
     else:
+        assert args.mode == "train"
         train(args)
