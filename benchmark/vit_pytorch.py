@@ -25,7 +25,7 @@ from PIL import Image
 from tqdm.auto import tqdm
 
 from torch.utils.tensorboard import SummaryWriter
-# from vit_pt_lucidrains import ViT as ViTRef
+from vit_pt_lucidrains import ViT as ViTRef
 
 
 DSET_CACHE_DIR = "./datasets/"
@@ -273,7 +273,10 @@ def local_map(xs, map_fn, num_workers, process=True, progress=False):
         for x in tqdm(pool.map(map_fn, xs), total=len(xs)):
             yield x
 
-def _imagenet_load_and_get_target(x):
+def _load_img(x):
+    if ".JPEG" not in x:
+        return None
+
     if not os.path.exists(x[".JPEG"]):
         return None
     try:
@@ -283,13 +286,17 @@ def _imagenet_load_and_get_target(x):
         return None
     return x
 
-def create_imagenet_dset_cache(args, split, shuffle):
-    root = args.imagenet_root
-    label_txt_path = os.path.join(root, "labels.txt")
-    labels = [(x.split(","), i) for i, x in enumerate(open(label_txt_path).readlines())]
-    labels = {x[0]: (i, x[1].strip()) for x, i in labels}
+def create_imagenet_dset_cache(args, split, shuffle, name, labels=None):
+    root = args.dataset_root
+    if labels is None:
+        label_txt_path = os.path.join(root, "labels.txt")
+        if os.path.exists(label_txt_path):
+            labels = [(x.split(","), i) for i, x in enumerate(open(label_txt_path).readlines())]
+            labels = {x[0]: (i, x[1].strip()) for x, i in labels}
+        else:
+            labels = {}
 
-    cache_path = os.path.join(DSET_CACHE_DIR, f"imagenet-{split}.jsonl")
+    cache_path = os.path.join(DSET_CACHE_DIR, f"{name}-{split}.jsonl")
     os.makedirs(DSET_CACHE_DIR, exist_ok=True)
 
     data = list(dataset_folder_iter(
@@ -299,15 +306,21 @@ def create_imagenet_dset_cache(args, split, shuffle):
         shuffle=False,
     ))
 
-    map_fn = _imagenet_load_and_get_target
+    map_fn = _load_img
     with open(cache_path, "w") as out_f:
         print("Writing cache...")
         count = 0
         xs = []
+        id = 0
         for x in local_map(data, map_fn, num_workers=args.num_workers, progress=True):
             if x is None:
                 continue
-            x["target"] = labels[x["dir"]][0]
+            key = x["dir"].split("/")[0]
+            if key not in labels:
+                print(f"WARN: adding, {key} to labels")
+                labels[key] = (id, key)
+                id += 1
+            x["target"] = labels[key][0]
             xs.append(x)
 
         if shuffle:
@@ -318,11 +331,12 @@ def create_imagenet_dset_cache(args, split, shuffle):
             out_f.write(json.dumps(x) + "\n")
             count += 1
         print(f"{len(data)} -> {count}", flush=True)
+    return labels
 
 
 def create_dset_cache(args):
-    create_imagenet_dset_cache(args, "train", True)
-    create_imagenet_dset_cache(args, "val", False)
+    labels = create_imagenet_dset_cache(args, "train", True, name=args.dataset_name)
+    create_imagenet_dset_cache(args, "val", False, name=args.dataset_name, labels=labels)
 
 
 def load_sample(x, transform):
@@ -407,14 +421,14 @@ class JsonlDset(torch.utils.data.Dataset):
 def get_dataset(args, split, transform, shuffle):
     if args.use_iter_dsets:
         return JsonlDsetIter(
-            path=os.path.join(DSET_CACHE_DIR, f"imagenet-{split}.jsonl"),
+            path=os.path.join(DSET_CACHE_DIR, f"{args.dataset_name}-{split}.jsonl"),
             transform=transform,
             shuffle=shuffle,
             shuffle_buf_size=args.shuffle_buf_size,
         )
     else:
         return JsonlDset(
-            path=os.path.join(DSET_CACHE_DIR, f"imagenet-{split}.jsonl"),
+            path=os.path.join(DSET_CACHE_DIR, f"{args.dataset_name}-{split}.jsonl"),
             transform=transform,
         )
 
@@ -476,26 +490,24 @@ def profile_dataloader(args):
 
 def train(args):
     # TODO: continue from checkpoint
-    if args.chkpt_dir is None:
-        print("--chkpt_dir not provided")
-        sys.exit(1)
+    assert args.chkpt_dir is not None, "--chkpt_dir not provided"
+    assert args.name is not None, "--name not provided"
 
     if args.ref:
-        raise AssertionError("unsupported")
-        # model = ViTRef(
-        #     image_size = args.img_size,
-        #     patch_size = 32,
-        #     num_classes = 1000,
-        #     depth = 12,
-        #     heads = 12,
-        #     dim = 768,
-        #     mlp_dim = 3072,
-        #     dropout = 0.1,
-        # )
+        model = ViTRef(
+            image_size = args.img_size,
+            patch_size = 32,
+            num_classes = args.num_classes,
+            depth = 12,
+            heads = 12,
+            dim = 768,
+            mlp_dim = 3072,
+            dropout = 0.1,
+        )
     else:
         model = ViT(
             image_size = args.img_size,
-            num_classes = 1000,
+            num_classes = args.num_classes,
             patch_size = 32,
             depth = 12,
             heads = 12,
@@ -533,12 +545,13 @@ def train(args):
     dataloader_avg = RollingAvg(args.iter_per_log)
     total_avg = RollingAvg(args.iter_per_log)
 
+    i = 0
     def log_metrics(val_metrics=None):
         log_t1 = time_ms()
         if val_metrics is None:
-            print(f"[{i}] loss={loss:.2f}", flush=True)
+            print(f"[{i}, {i/len(train_dloader):.1f}epochs] loss={loss:.2f}", flush=True)
         else:
-            print(f"[{i}] loss={loss:.2f}, val={val_metrics}", flush=True)
+            print(f"[{i}, {i/len(train_dloader):.1f}epochs] loss={loss:.2f} val={val_metrics}", flush=True)
         # TODO: avg of past N iters
         writer.add_scalar("Loss/train", loss_avg.get(), i)
         if val_metrics is not None:
@@ -558,7 +571,6 @@ def train(args):
 
     load_t1 = time_ms()
     total_t1 = time_ms()
-    i = 0
     last_k_chkpts = {}
     while i < args.niter:
         for x in train_dloader:
@@ -570,6 +582,12 @@ def train(args):
             y = model(img)
             forward_t2 = time_ms()
             forward_avg.add(forward_t2 - forward_t1)
+
+            # TODO: missing
+            # 1. data augmentation
+            #    - 
+            # 2. gradient clipping (1 global norm)
+            # 3. MixUp, RandAug
 
             backward_t1 = time_ms()
             optim.zero_grad()
@@ -597,6 +615,7 @@ def train(args):
                     for x in tqdm(val_dloader):
                         img = x["image"].to(device)
                         logits = model(img)
+                        logits = F.softmax(logits, dim=-1)
                         target = x["target"].to(device)
                         a1, a5 = accuracy(logits, target, topk=(1, 5))
                         acc1 += a1
@@ -606,13 +625,14 @@ def train(args):
 
                     acc1 /= n
                     acc5 /= n
-                    log_metrics({"top1": acc1, "top5": acc5})
-                model = model.train()
+                    top1 = acc1 * 100
+                    top5 = acc5 * 100
+                    log_metrics({"top1": top1, "top5": top5})
 
                 should_save = False
                 if len(last_k_chkpts) >= args.keep_k_chkpts:
                     for idx, info in last_k_chkpts.items():
-                        if info["top1"] < acc1:
+                        if info["top1"] < top1:
                             should_save = True
                             os.remove(info["path"])
                             del last_k_chkpts[idx]
@@ -624,15 +644,17 @@ def train(args):
                     to_save = {
                         "model_state_dict": model.state_dict(), 
                         "optim_state_dict": optim.state_dict(), 
-                        "top1": 100*acc1, "top5": 100*acc5,
+                        "top1": top1, "top5": top5,
                         "iter": i,
                         "loss": loss_avg.get(),
                     }
-                    path = os.path.join(chkpt_dir, f"{i}-top1:{100*acc1:.1f}.pt")
+                    path = os.path.join(chkpt_dir, f"{i}-top1:{top1:.1f}.pt")
                     torch.save(to_save, path)
                     last_k_chkpts[i] = {}
-                    last_k_chkpts[i]["top1"] = acc1
+                    last_k_chkpts[i]["top1"] = top1
                     last_k_chkpts[i]["path"] = path
+
+                model = model.train()
 
             elif i % args.iter_per_log == 0:
                 log_metrics()
@@ -763,12 +785,21 @@ if __name__ == "__main__":
         "--name",
         type=str,
         default=None,
-        required=True,
     )
     parser.add_argument(
-        "--imagenet_root",
+        "--dataset_name",
+        type=str,
+        default="imagenet",
+    )
+    parser.add_argument(
+        "--dataset_root",
         type=str,
         default=None,
+    )
+    parser.add_argument(
+        "--num_classes",
+        type=int,
+        default=1000,
     )
     args = parser.parse_args()
 
