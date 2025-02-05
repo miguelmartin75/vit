@@ -145,13 +145,13 @@ class TransformerEncoder(nn.Module):
         return self.norm(x)
 
 class ViT(nn.Module):
-    def __init__(self, patch_size=16, mlp_dim=2048, dim=1024, heads=8, depth=8, dropout=0.0, num_classes=1000, image_size=224, c=3):
+    def __init__(self, patch_size=16, mlp_dim=2048, dim=1024, heads=8, depth=8, dropout=0.0, num_classes=1000, image_size=224, channels=3):
         super().__init__()
 
         self.patch_size = patch_size
         self.dim = dim
-        self.c = c
-        self.patch_dim = patch_size * patch_size * c
+        self.c = channels
+        self.patch_dim = patch_size * patch_size * self.c
         self.N = (image_size*image_size) // (patch_size*patch_size)
 
         # NOTE: zeros
@@ -481,8 +481,9 @@ def create_dataloader(args, split, shuffle, device):
     dset = get_dataset(
         args,
         split=split,
-        transform=transforms.Compose(aug_transforms + [
+        transform=transforms.Compose([
             transforms.Resize((args.img_size, args.img_size)),
+        ] + aug_transforms + [
             transforms.ToTensor(),
             # [0, 1] -> [-1, -1]
             transforms.Lambda(lambda x: (x-0.5)/0.5),
@@ -538,13 +539,13 @@ def create_lr_step_fn(args):
     base_lr = args.lr
 
     def lr_step_fn(i):
-        if args.warmup and i < args.warmup:
-            return (i / args.warmup) * base_lr
+        if args.warmup_iter and i < args.warmup_iter:
+            return (i / args.warmup_iter) * base_lr
         else:
             # cosine schedule
             # https://github.com/google-research/vision_transformer/blob/main/vit_jax/utils.py#L87
 
-            t = torch.tensor((i - args.warmup) / (args.niter - args.warmup))
+            t = torch.tensor((i - args.warmup_iter) / (args.niter - args.warmup_iter))
             t = torch.clamp(t, 0.0, 1.0)
             lr = base_lr * 0.5 * (1 + torch.cos(torch.pi * t))
             return lr
@@ -556,42 +557,37 @@ def train(args):
     assert args.chkpt_dir is not None, "--chkpt_dir not provided"
     assert args.name is not None, "--name not provided"
 
-    model_class = ViTRef
+    model_class = ViT
     if args.ref:
-        model = ViTRef(
-            image_size = args.img_size,
-            num_classes = args.num_classes,
-            patch_size = args.patch_size,
-            depth = 12,
-            heads = 12,
-            dim = 768,
-            mlp_dim = 3072,
-            dropout = 0.1,  # TODO
-            c = 3 if not args.mnist else 1,
-        )
-    else:
-        model = ViT(
-            image_size = args.img_size,
-            num_classes = args.num_classes,
-            patch_size = args.patch_size,
-            depth = 12,
-            heads = 12,
-            dim = 768,
-            mlp_dim = 3072,
-            dropout = 0.1,  # TODO
-            c = 3 if not args.mnist else 1,
-        )
+        model_class = ViTRef
+
+    model = model_class(
+        image_size = args.img_size,
+        num_classes = args.num_classes,
+        patch_size = args.patch_size,
+        # ViT-S
+        depth = 12,
+        heads = 6,
+        dim = 384,
+        mlp_dim = 1536,
+        dropout = 0.1,
+        # ViT-B
+        # depth = 12,
+        # heads = 12,
+        # dim = 768,
+        # mlp_dim = 3072,
+        # dropout = 0.1,
+        channels = 3 if not args.mnist else 1,
+    )
+
     model = model.train().to(args.device)
     if args.no_compile:
         model = torch.compile(model)
     n_params = count_parameters(model)
     print("model params=", n_params)
 
-    # ds_now = datetime.datetime.now().strftime("%Y-%m-%d")
-    # log_dir = os.path.join(args.log_dir, args.name, ds_now)
     chkpt_dir = os.path.join(args.chkpt_dir, args.name)
     log_dir = os.path.join(args.log_dir, args.name)
-    chkpt_dir = args.chkpt_dir
     os.makedirs(log_dir, exist_ok=True)
     os.makedirs(chkpt_dir, exist_ok=True)
     writer = SummaryWriter(log_dir)
@@ -638,8 +634,12 @@ def train(args):
     if args.niter is None:
         assert args.epochs is not None
         args.niter = len(train_dloader) * args.epochs
+    if args.warmup_iter is None:
+        assert args.warmup_epochs is not None
+        args.warmup_iter = len(train_dloader) * args.warmup_epochs
 
     print("niter=", args.niter, flush=True)
+    print("warmup niter=", args.warmup_iter, flush=True)
     load_t1 = time_ms()
     total_t1 = time_ms()
     last_k_chkpts = {}
@@ -669,7 +669,7 @@ def train(args):
             forward_avg.add(forward_t2 - forward_t1)
 
             # TODO: missing
-            # 1. [ ] data augmentation
+            # 1. [x] data augmentation
             # 2. [x] gradient clipping (1 global norm)
             # 3. [ ] MixUp, RandAug
 
@@ -819,9 +819,14 @@ if __name__ == "__main__":
         default=200,
     )
     parser.add_argument(
-        "--warmup",
+        "--warmup_epochs",
         type=int,
-        default=10_000,
+        default=30,
+    )
+    parser.add_argument(
+        "--warmup_iter",
+        type=int,
+        default=None,
     )
     parser.add_argument(
         "--profile_warmup",
