@@ -68,7 +68,7 @@ class RollingAvg:
         return sum(self.data) / len(self.data)
 
 class MSA(nn.Module):
-    def __init__(self, dim, heads, dropout=0.0, fused = False):
+    def __init__(self, dim, heads, dropout, fused = False):
         super().__init__()
         self.dim = dim
         self.heads = heads
@@ -113,15 +113,14 @@ class MSA(nn.Module):
         return x
 
 class TransformerBlock(nn.Module):
-    def __init__(self, dim, heads, mlp_dim, dropout=0.0):
+    def __init__(self, dim, heads, mlp_dim, dropout):
         super().__init__()
-        # self.msa = MSA(dim=dim, heads=heads, dropout=dropout, fused=False)
-        # TODO: arg for fused
         self.msa = MSA(dim=dim, heads=heads, dropout=dropout, fused=True)
         self.mlp = nn.Sequential(
             nn.LayerNorm(dim),
             nn.Linear(dim, mlp_dim),
             nn.GELU(),
+            # nn.ReLU(True),
             nn.Dropout(dropout),
             nn.Linear(mlp_dim, dim),
             nn.Dropout(dropout),
@@ -155,13 +154,19 @@ class ViT(nn.Module):
         self.patch_dim = patch_size * patch_size * c
         self.N = (image_size*image_size) // (patch_size*patch_size)
 
-        self.class_tok = nn.Parameter(torch.randn(1, 1, dim))
+        # NOTE: zeros
+        # https://github.com/google-research/vision_transformer/blob/main/vit_jax/models_vit.py#L281
+        # self.class_tok = nn.Parameter(torch.randn(1, 1, dim))
+        self.class_tok = nn.Parameter(torch.zeros(1, 1, dim))
+        # NOTE: 
+        # TODO: * 0.02?
         self.pos_emb = nn.Parameter(torch.randn(1, self.N + 1, dim))
         self.patch_emb = nn.Sequential(
             nn.LayerNorm(self.patch_dim),
             nn.Linear(self.patch_dim, dim),
             nn.LayerNorm(dim),
         )
+        # NOTE: https://github.com/google-research/vision_transformer/blob/main/vit_jax/models_vit.py#L306-L307
         self.classify_head = nn.Linear(dim, num_classes)
         self.dropout = nn.Dropout(dropout)
 
@@ -172,6 +177,26 @@ class ViT(nn.Module):
             mlp_dim=mlp_dim,
             dropout=dropout,
         )
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        def init_weights(m):
+            if isinstance(m, nn.Linear):
+                # NOTE
+                # https://github.com/pytorch/pytorch/blob/main/torch/nn/modules/linear.py#L118-L122
+                # in ViT: 
+                # https://github.com/google-research/vision_transformer/blob/main/vit_jax/models_vit.py#L74-L77
+                torch.nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    m.bias.data.normal_(1e-6)
+            else:
+                pass
+                # raise AssertionError(f"unexpected: {m.__class__}")
+        self.apply(init_weights)
+
+        with torch.no_grad():
+            self.classify_head.weight.fill_(0)
+            self.classify_head.bias.fill_(0)
 
     def forward(self, x):
         if len(x.shape) != 4:
@@ -419,6 +444,15 @@ class JsonlDset(torch.utils.data.Dataset):
 
 
 def get_dataset(args, split, transform, shuffle):
+    if args.mnist:
+        assert split in ("train", "val")
+        return torchvision.datasets.MNIST(
+            root=DSET_CACHE_DIR,
+            train=(split=="train"),
+            download=True,
+            transform=transform,
+        )
+
     if args.use_iter_dsets:
         return JsonlDsetIter(
             path=os.path.join(DSET_CACHE_DIR, f"{args.dataset_name}-{split}.jsonl"),
@@ -433,23 +467,36 @@ def get_dataset(args, split, transform, shuffle):
         )
 
 def create_dataloader(args, split, shuffle, device):
+    aug_transforms = []
+    # TODO: arg
+    if split == "train":
+        aug_transforms = [
+            # transforms.RandomCrop(int(args.img_size*1.5)),
+            transforms.RandomHorizontalFlip(p=0.5),
+            transforms.RandomVerticalFlip(p=0.5),
+            transforms.ColorJitter(brightness=0.5, hue=0.3),
+            transforms.RandomGrayscale(p=0.1),
+        ]
+
     dset = get_dataset(
         args,
         split=split,
-        transform=transforms.Compose([
+        transform=transforms.Compose(aug_transforms + [
             transforms.Resize((args.img_size, args.img_size)),
             transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+            # [0, 1] -> [-1, -1]
+            transforms.Lambda(lambda x: (x-0.5)/0.5),
+            # transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
         ]),
         shuffle=shuffle,
     )
     dloader_kwargs = {
-        "num_workers":args.num_workers,
-        "batch_size":args.batch_size,
+        "num_workers": args.num_workers,
+        "batch_size": args.batch_size,
         "shuffle": False if args.use_iter_dsets else shuffle,
-        "pin_memory":args.pin_memory,
-        "persistent_workers":args.num_workers > 0,
-        "pin_memory_device":device if args.pin_memory else "",
+        "pin_memory": args.pin_memory,
+        "persistent_workers": args.num_workers > 0,
+        "pin_memory_device": device if args.pin_memory else "",
     }
     return torch.utils.data.DataLoader(
         dset,
@@ -487,33 +534,52 @@ def profile_dataloader(args):
     print(f"mean={t_samples.mean():.3f}ms, std={t_samples.std():.3f}ms, min={t_samples.min():.3f}ms, max={t_samples.max():.3f}ms", flush=True)
     print(f"samples/sec={1000*n_samples / t_samples.sum():.3f}")
 
+def create_lr_step_fn(args):
+    base_lr = args.lr
+
+    def lr_step_fn(i):
+        if args.warmup and i < args.warmup:
+            return (i / args.warmup) * base_lr
+        else:
+            # cosine schedule
+            # https://github.com/google-research/vision_transformer/blob/main/vit_jax/utils.py#L87
+
+            t = torch.tensor((i - args.warmup) / (args.niter - args.warmup))
+            t = torch.clamp(t, 0.0, 1.0)
+            lr = base_lr * 0.5 * (1 + torch.cos(torch.pi * t))
+            return lr
+
+    return lr_step_fn
 
 def train(args):
     # TODO: continue from checkpoint
     assert args.chkpt_dir is not None, "--chkpt_dir not provided"
     assert args.name is not None, "--name not provided"
 
+    model_class = ViTRef
     if args.ref:
         model = ViTRef(
             image_size = args.img_size,
-            patch_size = 32,
             num_classes = args.num_classes,
+            patch_size = args.patch_size,
             depth = 12,
             heads = 12,
             dim = 768,
             mlp_dim = 3072,
-            dropout = 0.1,
+            dropout = 0.1,  # TODO
+            c = 3 if not args.mnist else 1,
         )
     else:
         model = ViT(
             image_size = args.img_size,
             num_classes = args.num_classes,
-            patch_size = 32,
+            patch_size = args.patch_size,
             depth = 12,
             heads = 12,
             dim = 768,
             mlp_dim = 3072,
-            dropout = 0.1,
+            dropout = 0.1,  # TODO
+            c = 3 if not args.mnist else 1,
         )
     model = model.train().to(args.device)
     if args.no_compile:
@@ -523,7 +589,7 @@ def train(args):
 
     # ds_now = datetime.datetime.now().strftime("%Y-%m-%d")
     # log_dir = os.path.join(args.log_dir, args.name, ds_now)
-    # chkpt_dir = os.path.join(args.chkpt_dir, ds_now)
+    chkpt_dir = os.path.join(args.chkpt_dir, args.name)
     log_dir = os.path.join(args.log_dir, args.name)
     chkpt_dir = args.chkpt_dir
     os.makedirs(log_dir, exist_ok=True)
@@ -554,6 +620,7 @@ def train(args):
             print(f"[{i}, {i/len(train_dloader):.1f}epochs] loss={loss:.2f} val={val_metrics}", flush=True)
         # TODO: avg of past N iters
         writer.add_scalar("Loss/train", loss_avg.get(), i)
+        writer.add_scalar("lr", lr, i)
         if val_metrics is not None:
             for k, v in val_metrics.items():
                 writer.add_scalar(f"Val/{k}", v, i)
@@ -568,37 +635,59 @@ def train(args):
 
     train_dloader = create_dataloader(args, "train", shuffle=True, device=device)
     val_dloader = create_dataloader(args, "val", shuffle=False, device=device)
+    if args.niter is None:
+        assert args.epochs is not None
+        args.niter = len(train_dloader) * args.epochs
 
+    print("niter=", args.niter, flush=True)
     load_t1 = time_ms()
     total_t1 = time_ms()
     last_k_chkpts = {}
+
+    lr_fn = create_lr_step_fn(args)
     while i < args.niter:
         for x in train_dloader:
             load_t2 = time_ms()
             dataloader_avg.add(load_t2 - load_t1)
 
+            lr = lr_fn(i)
+            for param_group in optim.param_groups:
+                if isinstance(param_group["lr"], torch.Tensor):
+                    param_group["lr"].fill_(lr)
+                else:
+                    param_group["lr"] = lr
+
+            if args.mnist:  # TODO: fixme
+                x = {"image": x[0], "target": x[1]}
+
             forward_t1 = time_ms()
+
             img = x["image"].to(device)
             y = model(img)
+
             forward_t2 = time_ms()
             forward_avg.add(forward_t2 - forward_t1)
 
             # TODO: missing
-            # 1. data augmentation
-            #    - 
-            # 2. gradient clipping (1 global norm)
-            # 3. MixUp, RandAug
+            # 1. [ ] data augmentation
+            # 2. [x] gradient clipping (1 global norm)
+            # 3. [ ] MixUp, RandAug
 
             backward_t1 = time_ms()
+
             optim.zero_grad()
             target = x["target"].to(device)
             loss = F.cross_entropy(y, target)
             loss.backward()
+
             backward_t2 = time_ms()
             backward_avg.add(backward_t2 - backward_t1)
             loss_avg.add(loss.detach().cpu().item())
 
             optim_t1 = time_ms()
+            if args.gradient_clip:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), args.gradient_clip)
+
             optim.step()
             optim_t2 = time_ms()
             optim_avg.add(optim_t2 - optim_t1)
@@ -613,6 +702,9 @@ def train(args):
                     acc5 = 0
                     n = 0
                     for x in tqdm(val_dloader):
+                        if args.mnist:  # TODO: fixme
+                            x = {"image": x[0], "target": x[1]}
+
                         img = x["image"].to(device)
                         logits = model(img)
                         logits = F.softmax(logits, dim=-1)
@@ -714,12 +806,22 @@ if __name__ == "__main__":
     parser.add_argument(
         "--niter",
         type=int,
-        default=1_000_000,
+        default=None,
+    )
+    parser.add_argument(
+        "--epochs",
+        type=int,
+        default=300,
     )
     parser.add_argument(
         "--profile_nsamples",
         type=int,
         default=200,
+    )
+    parser.add_argument(
+        "--warmup",
+        type=int,
+        default=10_000,
     )
     parser.add_argument(
         "--profile_warmup",
@@ -747,6 +849,11 @@ if __name__ == "__main__":
         default=256,
     )
     parser.add_argument(
+        "--patch_size",
+        type=int,
+        default=32,
+    )
+    parser.add_argument(
         "--val_iter_freq",
         type=int,
         default=500,
@@ -760,6 +867,11 @@ if __name__ == "__main__":
         "--keep_k_chkpts",
         type=int,
         default=5,
+    )
+    parser.add_argument(
+        "--gradient_clip",
+        type=float,
+        default=1.0,
     )
     parser.add_argument(
         "--ref",
@@ -797,48 +909,18 @@ if __name__ == "__main__":
         default=None,
     )
     parser.add_argument(
+        "--mnist",
+        action="store_true",
+        default=False,
+    )
+    parser.add_argument(
         "--num_classes",
         type=int,
         default=1000,
     )
     args = parser.parse_args()
 
-    if args.mode == "test":
-        v = ViT(
-            image_size = 224,
-            patch_size = 16,
-            num_classes = 1000,
-            dim = 1024,
-            depth = 6,
-            heads = 16,
-            mlp_dim = 2048,
-            dropout = 0.1,
-            # emb_dropout = 0.1
-        )
-
-        v2 = ViTRef(
-            image_size = 224,
-            patch_size = 16,
-            num_classes = 1000,
-            dim = 1024,
-            depth = 6,
-            heads = 16,
-            mlp_dim = 2048,
-            dropout = 0.1,
-            emb_dropout = 0.1
-        )
-
-        img = torch.randn(1, 3, 224, 224)
-        y1 = v(img)
-        y2 = v2(img)
-
-        # input = torch.arange(81.).view(1, 9, 9)
-        # input = torch.stack([input, input*10, input*100])
-        # b, c, h, w = input.shape
-        # input.view(b, -1, 3, 3)
-        # patches = F.unfold(input, kernel_size=4, stride=4).view(b, -1, patch_dim)
-        breakpoint()
-    elif args.mode == "create_dset_cache":
+    if args.mode == "create_dset_cache":
         create_dset_cache(args)
     elif args.mode == "profile_dataloader":
         profile_dataloader(args)
