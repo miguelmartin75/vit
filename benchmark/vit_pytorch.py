@@ -67,6 +67,7 @@ class RollingAvg:
             return 0
         return sum(self.data) / len(self.data)
 
+# TODO: double check GELU not needed in MSA
 class MSA(nn.Module):
     def __init__(self, dim, heads, dropout, fused = False):
         super().__init__()
@@ -120,9 +121,8 @@ class TransformerBlock(nn.Module):
             nn.LayerNorm(dim),
             nn.Linear(dim, mlp_dim),
             nn.GELU(),
-            # nn.ReLU(True),
             nn.Dropout(dropout),
-            nn.Linear(mlp_dim, dim),
+            nn.Linear(mlp_dim, dim),  # TODO: double check GELU not needed here
             nn.Dropout(dropout),
         )
 
@@ -161,10 +161,12 @@ class ViT(nn.Module):
         # NOTE: 
         # TODO: * 0.02?
         self.pos_emb = nn.Parameter(torch.randn(1, self.N + 1, dim))
+
+        # TODO: check GELU not neede here
         self.patch_emb = nn.Sequential(
             nn.LayerNorm(self.patch_dim),
             nn.Linear(self.patch_dim, dim),
-            nn.LayerNorm(dim),
+            nn.LayerNorm(dim),  # TODO: note redundant layer norm
         )
         # NOTE: https://github.com/google-research/vision_transformer/blob/main/vit_jax/models_vit.py#L306-L307
         self.classify_head = nn.Linear(dim, num_classes)
@@ -189,9 +191,9 @@ class ViT(nn.Module):
                 torch.nn.init.xavier_uniform_(m.weight)
                 if m.bias is not None:
                     m.bias.data.normal_(1e-6)
-            else:
-                pass
-                # raise AssertionError(f"unexpected: {m.__class__}")
+            # elif isinstance(m, nn.LayerNorm):
+            #     m.weight.data.fill_(0)
+            #     m.bias.data.fill_(0)
         self.apply(init_weights)
 
         with torch.no_grad():
@@ -222,8 +224,124 @@ class ViT(nn.Module):
         x += self.pos_emb
         x = self.dropout(x)
 
-        # feed patch into MLP
         x = self.transformer(x)
+
+        x = x[:, 0]
+        x = self.classify_head(x)
+
+        return x
+
+class PatchedMLPEncoderBlock(nn.Module):
+    def __init__(self, dim, heads, mlp_dim, dropout, is_last):
+        super().__init__()
+        self.inner_dim = dim // heads
+        # self.inner_dim = dim
+        active_fn = nn.GELU
+        self.encoder = nn.Sequential(
+            nn.LayerNorm(dim),
+            nn.Linear(dim, self.inner_dim * heads),
+            active_fn(),
+            nn.Dropout(dropout),
+            nn.Linear(self.inner_dim * heads, dim),
+            nn.Dropout(dropout),
+        )
+        # self.mlp = nn.Identity()
+        # self.mlp = nn.Sequential(
+        #     nn.LayerNorm(dim),
+        #     nn.Linear(dim, mlp_dim),
+        #     nn.GELU(),
+        #     nn.Dropout(dropout),
+        #     nn.Linear(mlp_dim, dim),
+        #     nn.Dropout(dropout),
+        # )
+        # self.proj = nn.Linear(dim, dim)
+
+    def forward(self, x):
+        x = self.encoder(x) + x
+        # x = self.mlp(x) + x
+        # x = self.proj(x)
+        return x
+
+class PatchedMLPEncoder(nn.Module):
+    def __init__(self, n_layers, heads, dim, mlp_dim, dropout):
+        super().__init__()
+        self.encoder = nn.Sequential(*[
+            PatchedMLPEncoderBlock(dim=dim, heads=heads, mlp_dim=mlp_dim, dropout=dropout, is_last=(i==n_layers-1))
+            for i in range(n_layers)
+        ])
+        self.norm = nn.LayerNorm(dim)
+
+    def forward(self, x):
+        x = self.encoder(x)
+        return self.norm(x)
+
+class PatchedMLP(nn.Module):
+    def __init__(self, patch_size=16, mlp_dim=2048, dim=1024, heads=8, depth=8, dropout=0.0, num_classes=1000, image_size=224, channels=3):
+        super().__init__()
+        self.patch_size = patch_size
+        self.dim = dim
+        self.c = channels
+        self.patch_dim = patch_size * patch_size * self.c
+        self.N = (image_size*image_size) // (patch_size*patch_size)
+
+        self.patch_emb = nn.Sequential(
+            nn.LayerNorm(self.patch_dim),
+            nn.Linear(self.patch_dim, dim),
+            nn.LayerNorm(dim),  # TODO: remove
+        )
+        self.encoder = PatchedMLPEncoder(
+            n_layers=depth,
+            heads=heads,
+            dim=dim,
+            mlp_dim=mlp_dim,
+            dropout=dropout,
+        )
+        self.classify_head = nn.Linear(dim, num_classes)
+        self.dropout = nn.Dropout(dropout)
+
+        self.pos_emb = nn.Parameter(torch.randn(1, self.N + 1, dim))
+        self.class_tok = nn.Parameter(torch.zeros(1, 1, dim))
+
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        def init_weights(m):
+            if isinstance(m, nn.Linear):
+                torch.nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    m.bias.data.normal_(1e-6)
+            else:
+                pass
+        self.apply(init_weights)
+
+        with torch.no_grad():
+            self.classify_head.weight.fill_(0)
+            self.classify_head.bias.fill_(0)
+
+    def forward(self, x):
+        if len(x.shape) != 4:
+            # c h w -> b c h w
+            assert len(x.shape) == 3
+            x = x.unsqueeze(0)
+        b, c, h, w = x.shape
+
+        # get patches
+        x = x.unfold(2, self.patch_size, self.patch_size)
+        x = x.unfold(3, self.patch_size, self.patch_size)
+        # 0  1   2   3   4   5
+        # b, c, nh, nw, ps, ps -> b, nh, nw, c, ps, ps
+        x = x.permute(0, 2, 3, 4, 5, 1).reshape(b, -1, self.patch_size, self.patch_size, c)
+        n = x.shape[1]
+        x = x.reshape(b, n, self.patch_dim)
+        x = self.patch_emb(x)
+
+        class_toks = self.class_tok.repeat(b, 1, 1)
+        x = torch.cat((class_toks, x), dim=1)
+        # x += self.pos_emb[:, :(n+1)]
+        x += self.pos_emb
+        x = self.dropout(x)
+
+        x = self.encoder(x)
 
         x = x[:, 0]
         x = self.classify_head(x)
@@ -560,6 +678,8 @@ def train(args):
     model_class = ViT
     if args.ref:
         model_class = ViTRef
+    if args.mlp:
+        model_class = PatchedMLP
 
     model = model_class(
         image_size = args.img_size,
@@ -593,7 +713,8 @@ def train(args):
     writer = SummaryWriter(log_dir)
 
     device = args.device
-    optim = torch.optim.Adam(
+    # optim = torch.optim.Adam(
+    optim = torch.optim.AdamW(
         model.parameters(),
         lr=args.lr,
         betas=(0.9, 0.999),
@@ -779,7 +900,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--weight_decay",
         type=float,
-        default=1e-5,
+        default=0.1,
     )
     parser.add_argument(
         "-nw",
@@ -880,6 +1001,11 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--ref",
+        action="store_true",
+        default=False,
+    )
+    parser.add_argument(
+        "--mlp",
         action="store_true",
         default=False,
     )
