@@ -65,8 +65,20 @@ typedef struct {
 
 ViT vit_init(ViTModelParams params);
 void vit_destroy(ViT*);
-void vit_forward(ViT*, Tensor input);
+Tensor vit_forward(ViT* vit, Tensor input);
 Tensor vit_backward(ViT*);
+
+i64 shape_nelem(Shape shape);
+void shape_autofill(Shape* shape, Shape ref);
+
+Tensor tensor_view(Tensor x, Shape shape);
+Tensor tensor_matmul(Tensor a, Tensor b);
+Tensor tensor_cat(Tensor a, Tensor b, i32 dim);
+Tensor tensor_add(Tensor a, Tensor b);
+Tensor tensor_mean(Tensor x, i32 dim);
+Tensor tensor_variance(Tensor x, i32 dim);
+Tensor tensor_layer_norm(Tensor x);
+Tensor tensor_zeros(Shape shape);
 
 
 #ifdef  __cplusplus

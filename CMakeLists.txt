@@ -3,7 +3,7 @@ cmake_minimum_required(VERSION 3.5)
 project(
     vit
     LANGUAGES 
-    C CXX CUDA
+    C CXX
     VERSION 0.0.1
 )
 
@@ -30,13 +30,15 @@ add_compile_options(-fno-rtti)
 # add_link_options(-fsanitize=address)
 
 # TODO: library
-# add_library(libvit SHARED ${LIB_SRCS})
-add_executable(vit ${LIB_SRCS})
-target_include_directories(vit PUBLIC ${DEPS_INCLUDE_DIRS})
-target_link_libraries(vit PUBLIC fmt::fmt)
+add_library(libvit SHARED ${LIB_SRCS})
+add_executable(vit train.cpp)
+# target_include_directories(vit PUBLIC ${DEPS_INCLUDE_DIRS})
+target_include_directories(libvit PUBLIC ${DEPS_INCLUDE_DIRS})
+target_link_libraries(libvit PUBLIC fmt::fmt)
+target_link_libraries(vit PUBLIC fmt::fmt libvit)
 
 # TODO: tests
-# find_package(Catch2 3 REQUIRED)
-# add_executable(test_basetypes tests/test_basetypes.cpp)
-# target_link_libraries(test_parser PRIVATE Arriba)
+find_package(Catch2 3 REQUIRED)
+add_executable(tests tests.cpp)
+target_link_libraries(tests PRIVATE libvit Catch2::Catch2WithMain)
 

@@ -63,6 +63,10 @@ Tensor tensor_view(Tensor x, Shape shape) {
     };
 }
 
+Tensor tensor_matmul(Tensor a, Tensor b) {
+
+}
+
 Tensor tensor_cat(Tensor a, Tensor b, i32 dim) {
     // TODO
 }
@@ -109,11 +113,12 @@ struct ViT_CPU {
         x = tensor_layer_norm(x);
 
         // N x (P*P*C) -> N * D
-        x = tensor_matmul(x, ctx->patch_Wb);
+        x = tensor_matmul(x, patch_Wb);
         x = tensor_cat(class_emb, x, 1);
 
         Tensor pos_emb; // TODO: getme
         x = tensor_cat(pos_emb, x, 1);
+        return x;
     }
 };
 
@@ -143,37 +148,4 @@ Tensor vit_forward(ViT* vit, Tensor input) {
 
 Tensor vit_backward(ViT*) {
     // TODO
-}
-
-// TODO: moveme to tests
-void test_shape() {
-    Shape shape = shape_lit({-1, 16, 16});
-    VIT_ASSERT(shape_nelem(shape) == -256);
-
-    Shape ref = shape_lit({3, 224, 224});
-    shape_autofill(&shape, ref);
-    VIT_ASSERT(shape.dims[0] == 588);
-}
-
-void test_tensor_init() {
-    Tensor zeros = tensor_zeros(shape_lit({3, 224, 224}));
-    VIT_ASSERT(shape_nelem(zeros.shape) == 150528);
-
-    Tensor new_view = tensor_view(zeros, shape_lit({-1, 16*16}));
-    VIT_ASSERT(shape_nelem(new_view.shape) == 150528);
-    VIT_ASSERT(new_view.shape.dims[0] == 588);
-}
-
-int main() {
-    test_shape();
-    test_tensor_init();
-
-    ViT vit = vit_init(ViTModelParams{
-        // TODO
-        // .device = DEVICE_CPU,
-        .patch_size = 16
-    });
-
-    Tensor inp = tensor_zeros(shape_lit({3, 224, 224}));
-    vit_forward(&vit, inp);
 }
