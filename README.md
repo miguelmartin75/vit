@@ -19,13 +19,12 @@ language/framework benchmark for AI.
 | Mojo           | NOT STARTED | TODO                   | TODO                   |
 
 
-## Metrics
-
-### TODO Nvidia GPU
-| Lang/Framework | Relative Perf | Inference (/img) | Training (/img)     | Mem (GB)                   | LOC      | Binary Size (MB) |
-|:---------------|:--------------|:-------------------|:------------------|:---------------------------|:---------|:-----------------|
-| PyTorch        | 1.00            | TODO               | TODO              | 2.7+3+5                  | TODO     | TODO             |
-
 ## Try it Yourself
 
 See [docs/dev/NOTES.md](./docs/dev/NOTES.md)
+
+# Models
+
+| Model          | Pre-training data         | Top-1 IN-1k            | Link |
+|:---------------|:--------------------------|:-----------------------|:-----|
+| ViT-B/32       | IN-1k                     | 67.8%                  | TODO |

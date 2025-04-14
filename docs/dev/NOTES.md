@@ -37,16 +37,24 @@ python vit/pt.py create_dset_cache \
 ```
 python vit/pt.py train \
     --chkpt_dir /checkpoint/$USER/vit/ \
-    --name vit-s/32 \
+    --img_size 224 \
+    --name vit-s/32_ep-300_lr-0.001_do-0.00_wd-0.03 \
     --model_template vit-s \
     --patch_size 32 \
     --dropout 0.1 \
     -nw 20 \
-    --batch_size 384 \
+    --batch_size 512 \
     --warmup_epochs 30 \
     --epochs 300 \
-    --lr 0.01 \
+    --weight_decay 0.03 \
+    --lr 0.001 \
     --betas 0.9 0.999 \
     --val_iter_freq 1500 \
     --dataset_name imagenet
 ```
+
+# TODOs
+
+- [ ] PyTorch
+    - [ ] evaluate with multiple crops and avg.
+    - [ ] continue training

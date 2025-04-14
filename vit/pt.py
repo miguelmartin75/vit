@@ -295,7 +295,7 @@ class ViT(nn.Module):
         x = x.permute(0, 2, 3, 4, 5, 1).reshape(b, -1, self.patch_size, self.patch_size, c)
         n = x.shape[1]
         x = x.reshape(b, n, self.patch_dim)
-        x = self.patch_emb(x)
+        x = self.patch_emb(x)   # b, c, dim
 
         # add class tok and pos embeddings
         class_toks = self.class_tok.repeat(b, 1, 1)
@@ -423,12 +423,21 @@ def get_dataset(args, split, transform, shuffle):
             transform=transform,
         )
 
-def create_dataloader(args, split, shuffle, device):
+def create_dataloader(args, split, shuffle, device, aug_crops=False):
     prefix_transforms = [
         transforms.Resize((args.img_size, args.img_size)),
+        transforms.ToTensor(),
     ]
-    if split == "train":
+    if aug_crops:
+        assert split != "train"
         prefix_transforms = [
+            transforms.Resize(int(1.5*args.img_size)),
+            transforms.FiveCrop(args.img_size),
+            transforms.Lambda(lambda crops: torch.stack([transforms.ToTensor()(crop) for crop in crops]))
+        ]
+    elif split == "train":
+        prefix_transforms = [
+            # TODO: use RandomResizedCrop
             transforms.Resize(int(2*args.img_size)),
             transforms.RandomCrop(int(args.img_size*1.5)),
             transforms.Resize((args.img_size, args.img_size)),
@@ -436,13 +445,13 @@ def create_dataloader(args, split, shuffle, device):
             transforms.RandomVerticalFlip(p=0.5),
             transforms.ColorJitter(brightness=0.5, hue=0.3),
             transforms.RandomGrayscale(p=0.05),
+            transforms.ToTensor(),
         ]
 
     dset = get_dataset(
         args,
         split=split,
         transform=transforms.Compose(prefix_transforms + [
-            transforms.ToTensor(),
             # [0, 1] -> [-1, -1]
             transforms.Lambda(lambda x: (x-0.5)/0.5),
             # transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
@@ -510,13 +519,8 @@ def create_lr_step_fn(args):
 
     return lr_step_fn
 
-def train(args):
-    # TODO: continue from checkpoint
-    assert args.chkpt_dir is not None, "--chkpt_dir not provided"
-    assert args.name is not None, "--name not provided"
-    assert args.model_template in MODEL_TEMPLATES, f"unknown model template: {args.model_template}"
-
-    model = ViT(
+def create_model(args):
+    return ViT(
         image_size = args.img_size,
         num_classes = args.num_classes,
         patch_size = args.patch_size,
@@ -525,6 +529,60 @@ def train(args):
         **MODEL_TEMPLATES[args.model_template],
     )
 
+
+def val(args):
+    chkpt = torch.load(args.chkpt)
+    model = create_model(args)  # TODO: save model args in chkpt
+    model.load_state_dict(chkpt["model_state_dict"])
+
+    device = args.device
+
+    val_dloader = create_dataloader(
+        args,
+        "val",
+        shuffle=False,
+        device=device,
+        aug_crops=True,
+    )
+    model = model.eval().to(device)
+    with torch.no_grad():
+        acc1 = 0
+        acc5 = 0
+        n = 0
+        for x in tqdm(val_dloader):
+            if args.mnist:  # TODO: fixme
+                x = {"image": x[0], "target": x[1]}
+
+            img = x["image"].to(device)
+            b, ncrops, c, h, w = img.shape
+            img = img.view(b*ncrops, c, h, w)
+            logits = model(img)
+            logits = logits.view(b, ncrops, -1)
+            logits = F.softmax(logits, dim=-1)
+            logits = logits.mean(1)
+            target = x["target"].to(device)
+            a1, a5 = accuracy(logits, target, topk=(1, 5))
+            acc1 += a1
+            acc5 += a5
+            n += b
+            del logits, img, target
+
+        acc1 /= n
+        acc5 /= n
+        top1 = acc1 * 100
+        top5 = acc5 * 100
+
+    breakpoint()
+    print(f"Top 1 = {top1:.2f}")
+    print(f"Top 5 = {top5:.2f}")
+
+def train(args):
+    # TODO: continue from checkpoint
+    assert args.chkpt_dir is not None, "--chkpt_dir not provided"
+    assert args.name is not None, "--name not provided"
+    assert args.model_template in MODEL_TEMPLATES, f"unknown model template: {args.model_template}"
+
+    model = create_model(args)
     dtype = torch.float32
     # TODO: does it learn?
     if args.bfloat16:
@@ -814,7 +872,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--img_size",
         type=int,
-        default=256,
+        default=224,
     )
     parser.add_argument(
         "--patch_size",
@@ -887,12 +945,24 @@ if __name__ == "__main__":
         type=int,
         default=1000,
     )
+    parser.add_argument(
+        "--chkpt",
+        type=str,
+        default=None,
+    )
+    parser.add_argument(
+        "--no_aug_val",
+        action="store_true",
+        default=False,
+    )
     args = parser.parse_args()
 
     if args.mode == "create_dset_cache":
         create_dset_cache(args)
     elif args.mode == "profile_dataloader":
         profile_dataloader(args)
+    elif args.mode == "val":
+        val(args)
     else:
         assert args.mode == "train"
         train(args)
