@@ -11,7 +11,8 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_EXPORT_COMPILE_COMMANDS YES)
 
 set(LIB_SRCS 
-    vit.cpp
+    # vit.cpp
+    vit.cu
 )
 set(
     DEPS_INCLUDE_DIRS

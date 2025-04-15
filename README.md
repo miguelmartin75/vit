@@ -1,11 +1,10 @@
 # vit
 
-An implementation of ViT in multiple languages and frameworks. This is a
-language/framework benchmark for AI.
+An implementation of ViT in multiple languages and frameworks.
 - [x] PyTorch
 - [ ] C++ (CPU)
-- [ ] CUDA
-- [ ] SYCL (Intel GPUs)
+- [ ] C++ CUDA
+- [ ] C++ SYCL (Intel GPUs)
 - [ ] Mojo
 
 ## Feature Matrix
@@ -14,8 +13,8 @@ language/framework benchmark for AI.
 |:---------------|:------------|:-----------------------|:-----------------------|
 | PyTorch        | DONE        | TODO                   | TODO                   |
 | C++ (CPU)      | NOT STARTED | TODO                   | TODO                   |
-| CUDA           | NOT STARTED | TODO                   | TODO                   |
-| SYCL           | NOT STARTED | TODO                   | TODO                   |
+| C++ CUDA       | NOT STARTED | TODO                   | TODO                   |
+| C++ SYCL       | NOT STARTED | TODO                   | TODO                   |
 | Mojo           | NOT STARTED | TODO                   | TODO                   |
 
 

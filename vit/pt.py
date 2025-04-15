@@ -433,6 +433,7 @@ def create_dataloader(args, split, shuffle, device, aug_crops=False):
         prefix_transforms = [
             transforms.Resize(int(1.5*args.img_size)),
             transforms.FiveCrop(args.img_size),
+            # transforms.TenCrop(args.img_size),
             transforms.Lambda(lambda crops: torch.stack([transforms.ToTensor()(crop) for crop in crops]))
         ]
     elif split == "train":
@@ -572,7 +573,6 @@ def val(args):
         top1 = acc1 * 100
         top5 = acc5 * 100
 
-    breakpoint()
     print(f"Top 1 = {top1:.2f}")
     print(f"Top 5 = {top5:.2f}")
 

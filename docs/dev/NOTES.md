@@ -56,5 +56,5 @@ python vit/pt.py train \
 # TODOs
 
 - [ ] PyTorch
-    - [ ] evaluate with multiple crops and avg.
+    - [x] evaluate with multiple crops and avg.
     - [ ] continue training
