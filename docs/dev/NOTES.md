@@ -5,7 +5,6 @@
 ### CPU or Nvidia GPU
 ```
 export ENV_NAME=py312
-# conda remove -n vit_benchmark --all -y
 conda create -n $ENV_NAME python=3.12 -y
 conda activate $ENV_NAME
 
@@ -31,9 +30,40 @@ python vit/pt.py create_dset_cache \
     --dataset_name imagenet
 ```
 
-# train
+## imagenet-21k
+```
+python vit/pt.py create_dset_cache \
+    -nw 20 \
+    --dataset_root /fastdatasets/imagenet21k_resized/ \
+    --dataset_name imagenet-21k
+```
+
+# pre-train
 
 ## pytorch
+
+### imagenet-21k
+```
+python vit/pt.py train \
+    --chkpt_dir /checkpoint/$USER/vit/ \
+    --img_size 224 \
+    --name vit-s/in-21k/32_ep-300_lr-0.001_do-0.00_wd-0.03 \
+    --model_template vit-s \
+    --patch_size 32 \
+    --dropout 0.1 \
+    -nw 20 \
+    --batch_size 1024 \
+    --warmup_epochs 30 \
+    --epochs 300 \
+    --weight_decay 0.03 \
+    --lr 0.001 \
+    --betas 0.9 0.999 \
+    --val_iter_freq 5000 \
+    --dataset_name imagenet-21k \
+    --num_classes 10450
+```
+
+### imagenet 1k
 ```
 python vit/pt.py train \
     --chkpt_dir /checkpoint/$USER/vit/ \
@@ -49,11 +79,11 @@ python vit/pt.py train \
     --weight_decay 0.03 \
     --lr 0.001 \
     --betas 0.9 0.999 \
-    --val_iter_freq 1500 \
-    --dataset_name imagenet
+    --val_iter_freq 5000 \
+    --dataset_name imagenet \
 ```
 
-# TODOs
+# Backlog (TODOs)
 
 - [ ] PyTorch
     - [x] evaluate with multiple crops and avg.

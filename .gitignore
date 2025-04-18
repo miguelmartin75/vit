@@ -4,3 +4,4 @@ datasets/**
 deps/**
 !deps/fmt
 !deps/stb
+!deps/ggml
