@@ -407,7 +407,7 @@ def get_dataset(args, split, transform, shuffle):
         )
 
     if args.use_iter_dsets:
-        from vit.vit_pt_ext import JsonlDsetIter
+        from vit.pt_ext import JsonlDsetIter
         return JsonlDsetIter(
             path=os.path.join(DSET_CACHE_DIR, f"{args.dataset_name}-{split}.jsonl"),
             transform=transform,

@@ -1,3 +1,5 @@
+import math
+import torch
 # additional "unnecessary" code for vit_pt 
 
 def dset_iter(xs, load_sample_fn, transform, shuffle, shuffle_buf_size, start=0, end=None):
@@ -16,7 +18,7 @@ def dset_iter(xs, load_sample_fn, transform, shuffle, shuffle_buf_size, start=0,
             buf = []
 
     for x in buf:
-        x = load_sample(copy.deepcopy(x), transform)
+        x = load_sample_fn(copy.deepcopy(x), transform)
         yield x
 
 
