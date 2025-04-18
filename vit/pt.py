@@ -604,17 +604,18 @@ def train(args):
 
 
     i = 0
+    chkpt_i = 0
     if not args.from_nada:
         chkpt_to_use = None
-        max_i = 0
+        chkpt_i = 0
         for rel_path, path in list_files(chkpt_dir):
             i = int(rel_path.split("-")[0])
-            if i > max_i:
-                max_i = i
+            if i > chkpt_i:
+                chkpt_i = i
                 chkpt_to_use = path
         
         if chkpt_to_use:
-            print(f"loading: {chkpt_to_use}, iteration={max_i}")
+            print(f"loading: {chkpt_to_use}, iteration={chkpt_i}")
             chkpt = torch.load(chkpt_to_use)
             model.load_state_dict(chkpt["model_state_dict"])
             optim.load_state_dict(chkpt["optim_state_dict"])
@@ -703,7 +704,7 @@ def train(args):
             total_t2 = time_ms()
             total_avg.add(total_t2 - total_t1)
             del img, target
-            if (i != 0 or args.val_first_iter) and i % args.val_iter_freq == 0:
+            if (i != chkpt_i or args.val_first_iter) and i % args.val_iter_freq == 0:
                 model = model.eval()
                 with torch.no_grad():
                     acc1 = 0
