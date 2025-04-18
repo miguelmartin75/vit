@@ -19,7 +19,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torchvision
 import torchvision.transforms as transforms
-import torchvision.transforms.functional as TF
 
 from PIL import Image
 from tqdm.auto import tqdm
@@ -54,14 +53,16 @@ def count_parameters(model):
             total_params += p.numel()
     return total_params
 
-# taken from: https://github.com/mlfoundations/open_clip/blob/main/src/training/zero_shot.py#L29
+# ref: https://github.com/mlfoundations/open_clip/blob/main/src/training/zero_shot.py#L29
 def accuracy(output, target, topk=(1,)):
+    assert len(output.shape) == 2
     pred = output.topk(max(topk), 1, True, True)[1].t()
-    correct = pred.eq(target.view(1, -1).expand_as(pred))
-    return [
-        float(correct[:k].reshape(-1).float().sum(0, keepdim=True).cpu().numpy())
+    correct = (pred == target.view(1, -1)).expand_as(pred)
+    result = [
+        correct[:k].reshape(-1).float().sum(0, keepdim=True).cpu().item()
         for k in topk
     ]
+    return result
 
 class RollingAvg:
     def __init__(self, n):
@@ -140,7 +141,7 @@ def local_map(xs, map_fn, num_workers, process=True, progress=False):
 
 # * SECTION: model
 class MSA(nn.Module):
-    def __init__(self, dim, heads, dropout, fused = False):
+    def __init__(self, dim, heads, dropout, fused):
         super().__init__()
         self.dim = dim
         self.heads = heads
@@ -178,7 +179,7 @@ class MSA(nn.Module):
             sa = F.softmax(sa, dim=-1)
             sa = self.dropout(sa)
             x = torch.matmul(sa, v)
-    
+
         x = x.transpose(1, 2).reshape(b, n, c)
         x = self.proj(x)
         x = self.dropout(x)
@@ -257,7 +258,7 @@ class ViT(nn.Module):
             if isinstance(m, nn.Linear):
                 # NOTE
                 # https://github.com/pytorch/pytorch/blob/main/torch/nn/modules/linear.py#L118-L122
-                # in ViT: 
+                # in ViT:
                 # https://github.com/google-research/vision_transformer/blob/main/vit_jax/models_vit.py#L74-L77
                 torch.nn.init.xavier_uniform_(m.weight)
                 if m.bias is not None:
@@ -312,7 +313,7 @@ def _load_img(x):
         return None
     return x
 
-def create_imagenet_dset_cache(args, split, shuffle, name, labels=None):
+def create_imagenet_dset_cache(args, split, shuffle, name, labels=None, print_warnings=False):
     root = args.dataset_root
     if labels is None:
         label_txt_path = os.path.join(root, "labels.txt")
@@ -342,7 +343,8 @@ def create_imagenet_dset_cache(args, split, shuffle, name, labels=None):
                 continue
             key = x["dir"].split("/")[0]
             if key not in labels:
-                print(f"WARN: adding, {key} to labels")
+                if print_warnings:
+                    print(f"WARN: adding, {key} to labels")
                 labels[key] = (id, key)
                 id += 1
             x["target"] = labels[key][0]
@@ -361,7 +363,15 @@ def create_imagenet_dset_cache(args, split, shuffle, name, labels=None):
 
 def create_dset_cache(args):
     labels = create_imagenet_dset_cache(args, "train", True, name=args.dataset_name)
-    create_imagenet_dset_cache(args, "val", False, name=args.dataset_name, labels=labels)
+    create_imagenet_dset_cache(
+        args,
+        "val",
+        False,
+        name=args.dataset_name,
+        labels=labels,
+        # NOTE: val & train should have the same labels
+        print_warnings=True,
+    )
 
 
 def load_sample(x, transform):
@@ -420,7 +430,6 @@ def create_dataloader(args, split, shuffle, device, aug_crops=False):
         prefix_transforms = [
             transforms.Resize(int(1.5*args.img_size)),
             transforms.FiveCrop(args.img_size),
-            # transforms.TenCrop(args.img_size),
             transforms.Lambda(lambda crops: torch.stack([transforms.ToTensor()(crop) for crop in crops]))
         ]
     elif split == "train":
@@ -524,6 +533,9 @@ def val(args):
     model.load_state_dict(chkpt["model_state_dict"])
 
     device = args.device
+    dtype = torch.float32
+    if args.bfloat16:
+        dtype = torch.bfloat16
 
     val_dloader = create_dataloader(
         args,
@@ -532,7 +544,8 @@ def val(args):
         device=device,
         aug_crops=True,
     )
-    model = model.eval().to(device)
+    model = model.eval().to(device, dtype=dtype)
+    # model = torch.compile(model)
     with torch.no_grad():
         acc1 = 0
         acc5 = 0
@@ -541,14 +554,14 @@ def val(args):
             if args.mnist:  # TODO: fixme
                 x = {"image": x[0], "target": x[1]}
 
-            img = x["image"].to(device)
+            img = x["image"].to(device, dtype=dtype)
             b, ncrops, c, h, w = img.shape
             img = img.view(b*ncrops, c, h, w)
             logits = model(img)
             logits = logits.view(b, ncrops, -1)
             logits = F.softmax(logits, dim=-1)
             logits = logits.mean(1)
-            target = x["target"].to(device)
+            target = x["target"].to(device, dtype=dtype)
             a1, a5 = accuracy(logits, target, topk=(1, 5))
             acc1 += a1
             acc5 += a5
@@ -571,7 +584,6 @@ def train(args):
 
     model = create_model(args)
     dtype = torch.float32
-    # TODO: does it learn?
     if args.bfloat16:
         dtype = torch.bfloat16
 
@@ -613,14 +625,14 @@ def train(args):
             if i > chkpt_i:
                 chkpt_i = i
                 chkpt_to_use = path
-        
+
         if chkpt_to_use:
             print(f"loading: {chkpt_to_use}, iteration={chkpt_i}")
             chkpt = torch.load(chkpt_to_use)
             model.load_state_dict(chkpt["model_state_dict"])
             optim.load_state_dict(chkpt["optim_state_dict"])
             i = chkpt["iter"]
-        
+
     def log_metrics(val_metrics=None):
         log_t1 = time_ms()
         if val_metrics is None:
@@ -714,10 +726,10 @@ def train(args):
                         if args.mnist:  # TODO: fixme
                             x = {"image": x[0], "target": x[1]}
 
-                        img = x["image"].to(device)
+                        img = x["image"].to(device, dtype=dtype)
                         logits = model(img)
                         logits = F.softmax(logits, dim=-1)
-                        target = x["target"].to(device)
+                        target = x["target"].to(device, dtype=dtype)
                         a1, a5 = accuracy(logits, target, topk=(1, 5))
                         acc1 += a1
                         acc5 += a5
@@ -743,8 +755,8 @@ def train(args):
 
                 if should_save:
                     to_save = {
-                        "model_state_dict": model.state_dict(), 
-                        "optim_state_dict": optim.state_dict(), 
+                        "model_state_dict": model.state_dict(),
+                        "optim_state_dict": optim.state_dict(),
                         "top1": top1, "top5": top5,
                         "iter": i,
                         "loss": loss_avg.get(),

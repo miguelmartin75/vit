@@ -11,15 +11,6 @@ An implementation of ViT in multiple languages and frameworks.
 >PyTorch is the only implementation I have finished. Other implementations are a
 work-in-progress.
 
-## Feature Matrix
-
-| Lang/Framework | Status      | Quantization           | Optimizer Quantization |
-|:---------------|:------------|:-----------------------|:-----------------------|
-| PyTorch        | DONE        | TODO                   | TODO                   |
-| C++ CPU        | NOT STARTED | TODO                   | TODO                   |
-| C++ CUDA       | NOT STARTED | TODO                   | TODO                   |
-| Mojo           | NOT STARTED | TODO                   | TODO                   |
-
 ## Try it Yourself
 
 See [docs/dev/NOTES.md](./docs/dev/NOTES.md)
@@ -28,7 +19,7 @@ See [docs/dev/NOTES.md](./docs/dev/NOTES.md)
 
 | Model          | Pre-training data   | Top-1 IN-1k            | Link       |
 |:---------------|:--------------------|:-----------------------|:-----------|
-| ViT-S/32       | IN-1k               | 67.8%*                 | [gdrive](https://drive.google.com/file/d/1ACvPXIMwKPOwP2ijTeXO5rb0GBNyqmIj/view?usp=sharing) |
+| ViT-S/32       | IN-1k               | 67.7%*                 | [gdrive](https://drive.google.com/file/d/1ACvPXIMwKPOwP2ijTeXO5rb0GBNyqmIj/view?usp=sharing) |
 | ViT-S/32       | IN-21k              | DOING                  | TODO       |
 
 \* yes this model gets out performed by a ResNet-50 on IN-1k. However, this
@@ -45,7 +36,7 @@ I followed the [original ViT's](https://github.com/google-research/vision_transf
 - H-params for the model architecture
 
 ## Train/Eval Lessons
-Training a ViT from scratch is not easy (due to compute requirements and hparam tweaking).
+Training a ViT from scratch has it's challenges due to compute requirements and hparam tweaking.
 
 1. When training from scratch: 
     1. Warming-up the LR is **very important**. Training a ViT from scratch is not like training a CNN.

@@ -23,10 +23,11 @@ python -m pip install torch==2.3.1+cxx11.abi torchvision==0.18.1+cxx11.abi torch
 # datasets
 
 ## imagenet
+NOTE: use this script https://github.com/tensorflow/models/blob/master/research/slim/datasets/preprocess_imagenet_validation_data.py
 ```
 python vit/pt.py create_dset_cache \
     -nw 20 \
-    --dataset_root /datasets/imagenet/
+    --dataset_root /datasets/imagenet/ILSVRC/Data/CLS-LOC/ \
     --dataset_name imagenet
 ```
 
