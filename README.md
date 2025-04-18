@@ -24,8 +24,10 @@ See [docs/dev/NOTES.md](./docs/dev/NOTES.md)
 
 | Model          | Pre-training data   | Top-1 IN-1k            | Link       |
 |:---------------|:--------------------|:-----------------------|:-----------|
-| ViT-B/32       | IN-1k               | 67.8%                  | [gdrive]() |
-| ViT-B/32       | IN-21k              | DOING                  | TODO       |
+| ViT-S/32       | IN-1k^1             | 67.8%                  | [gdrive](TODO) |
+| ViT-S/32       | IN-21k              | DOING                  | TODO       |
+
+^1 note that this is IN-1k, hence the lower Top-1 compared to other pre-trained ViTs.
 
 # Train/Eval Notes
 
