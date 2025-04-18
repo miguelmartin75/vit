@@ -83,8 +83,8 @@ python vit/pt.py train \
     --dataset_name imagenet \
 ```
 
-# Backlog (TODOs)
+# TODOs
 
-- [ ] PyTorch
+- [x] PyTorch
     - [x] evaluate with multiple crops and avg.
-    - [ ] continue training
+    - [x] continue training

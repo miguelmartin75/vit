@@ -81,16 +81,13 @@ class RollingAvg:
 def list_files(path):
     for root, _, files in os.walk(path):
         for f in files:
-            yield os.path.join(root, f)
+            yield (f, os.path.join(root, f))
 
-# TODO: simplify this
 def dataset_folder_iter(
     dataset: str,
     offset: int,
     limit: Optional[int],
-    shuffle: bool,
     filter_exts: Optional[Set[str]] = None,
-    shuffle_fn=random.shuffle,
     **kwargs,
 ):
     print(
@@ -116,14 +113,8 @@ def dataset_folder_iter(
         f'dataset_folder_iter("{dataset}", offset={offset}, limit={limit}) path expansion took {(t2-t1)/1e6:.3f}ms; num_paths={len(paths)}, total num_paths={old_len}',
         flush=True
     )
-    # TODO: don't use this shuffle_fn
-    if shuffle:
-        shuffle_fn(paths)
 
-    if filter_exts is None:
-        filter_exts = set()
-
-    for path in paths:
+    for _, path in paths:
         bn, ext = os.path.splitext(path)
         dirname = os.path.dirname(bn)
         if filter_exts and ext not in filter_exts:
@@ -271,9 +262,6 @@ class ViT(nn.Module):
                 torch.nn.init.xavier_uniform_(m.weight)
                 if m.bias is not None:
                     m.bias.data.normal_(1e-6)
-            # elif isinstance(m, nn.LayerNorm):
-            #     m.weight.data.fill_(0)
-            #     m.bias.data.fill_(0)
         self.apply(init_weights)
 
         with torch.no_grad():
@@ -341,7 +329,6 @@ def create_imagenet_dset_cache(args, split, shuffle, name, labels=None):
         os.path.join(root, split),
         0,
         None,
-        shuffle=False,
     ))
 
     map_fn = _load_img
@@ -601,7 +588,6 @@ def train(args):
     writer = SummaryWriter(log_dir)
 
     device = args.device
-    # optim = torch.optim.Adam(
     optim = torch.optim.AdamW(
         model.parameters(),
         lr=args.lr,
@@ -616,7 +602,24 @@ def train(args):
     dataloader_avg = RollingAvg(args.iter_per_log)
     total_avg = RollingAvg(args.iter_per_log)
 
+
     i = 0
+    if not args.from_nada:
+        chkpt_to_use = None
+        max_i = 0
+        for rel_path, path in list_files(chkpt_dir):
+            i = int(rel_path.split("-")[0])
+            if i > max_i:
+                max_i = i
+                chkpt_to_use = path
+        
+        if chkpt_to_use:
+            print(f"loading: {chkpt_to_use}, iteration={max_i}")
+            chkpt = torch.load(chkpt_to_use)
+            model.load_state_dict(chkpt["model_state_dict"])
+            optim.load_state_dict(chkpt["optim_state_dict"])
+            i = chkpt["iter"]
+        
     def log_metrics(val_metrics=None):
         log_t1 = time_ms()
         if val_metrics is None:
@@ -952,6 +955,11 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--no_aug_val",
+        action="store_true",
+        default=False,
+    )
+    parser.add_argument(
+        "--from_nada",
         action="store_true",
         default=False,
     )
